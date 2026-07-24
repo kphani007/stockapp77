@@ -143,6 +143,31 @@ h1,h2,h3,h4,h5 { font-family:'Archivo', sans-serif; letter-spacing:-0.02em; }
 .disc{ font-size:0.76rem; color:var(--muted); line-height:1.6;
   border-top:1px solid var(--line); padding-top:14px; margin-top:10px; }
 .stButton>button{ border-radius:9px; font-weight:500; }
+
+/* --- custom results table (matches the prototype) --- */
+.sh-tablewrap{ border:1px solid #E5ECF1; border-radius:12px; overflow-x:auto; margin-top:6px; }
+.sh-table{ width:100%; border-collapse:collapse; }
+.sh-table thead th{ background:#F5F8FA; padding:11px 14px; font-size:0.68rem;
+  text-transform:uppercase; letter-spacing:0.07em; color:var(--muted); font-weight:600;
+  white-space:nowrap; }
+.sh-table .th-r{ text-align:right; } .sh-table .th-c{ text-align:center; }
+.sh-table .th-l{ text-align:left; }
+.sh-table td{ padding:12px 14px; border-top:1px solid #EEF3F6; white-space:nowrap;
+  font-size:0.85rem; color:var(--text); }
+.sh-table tbody tr{ transition:background .1s; }
+.sh-table tbody tr:hover{ background:#F5F8FA; }
+.sh-table .c-date{ font-family:'IBM Plex Mono',monospace; font-size:0.8rem; color:var(--muted); }
+.sh-table a.c-sym{ font-family:'IBM Plex Mono',monospace; font-weight:600; font-size:0.86rem;
+  color:var(--teal); text-decoration:none; }
+.sh-table a.c-sym:hover{ text-decoration:underline; }
+.sh-table .c-sec{ font-weight:500; }
+.sh-table .c-num{ font-family:'IBM Plex Mono',monospace; text-align:right; }
+.sh-table .c-muted{ color:var(--muted); }
+.sh-table .c-rsi{ font-weight:600; font-size:0.9rem; }
+.sh-table .c-reco{ text-align:center; }
+.sh-table .pill{ font-family:'IBM Plex Mono',monospace; font-size:0.68rem; font-weight:600;
+  padding:3px 9px; border-radius:6px; color:#FFF; white-space:nowrap; }
+.sh-hint{ margin-top:10px; font-size:0.75rem; color:#8794A1; }
 </style>
 """
 
@@ -782,43 +807,39 @@ else:
                 f"{st.session_state.get('threshold', threshold)} or above, "
                 f"from {st.session_state.get('scanned', 0)} scanned.")
 
-    disp = results.copy()
-    disp["Stock Symbol"] = disp["Stock Symbol"].apply(lambda s: f"?stock={s}")
+    def _fmt(x):
+        return f"{x:,.2f}" if isinstance(x, (int, float)) else str(x)
 
-    def _style(col):
-        if col.name == "RSI":
-            return [f"color:{rsi_color(v)};font-weight:600" for v in col]
-        if col.name == "Sector":
-            return [f"color:{sector_color(v)};font-weight:500" for v in col]
-        if col.name == "Buy/Sell":
-            return [f"color:{reco_color(v)};font-weight:500" for v in col]
-        return ["" for _ in col]
+    aligns = ["l", "l", "l", "r", "r", "r", "c", "r"]
+    head_html = "".join(
+        f'<th class="th-{a}">{h}</th>' for h, a in zip(HEADERS, aligns))
 
-    event = st.dataframe(
-        disp.style.apply(_style, axis=0),
-        use_container_width=True, hide_index=True,
-        on_select="rerun", selection_mode="single-row", key="screener_table",
-        column_config={
-            "Stock Symbol": st.column_config.LinkColumn(
-                "Stock Symbol", display_text=r"stock=(.+)",
-                help="Click the symbol to open its detail view"),
-            "RSI": st.column_config.NumberColumn("RSI", format="%.1f"),
-            "Current Price (Rs)": st.column_config.NumberColumn(format="%.2f"),
-            "52 Week High (Rs)": st.column_config.NumberColumn(format="%.2f"),
-        })
+    body_rows = []
+    for _, r in results.iterrows():
+        sym = r["Stock Symbol"]
+        rsi = r["RSI"]
+        reco = r["Buy/Sell"]
+        rsi_txt = f"{rsi:.1f}" if isinstance(rsi, (int, float)) else str(rsi)
+        body_rows.append(
+            "<tr>"
+            f'<td class="c-date">{r["Date"]}</td>'
+            f'<td><a class="c-sym" href="?stock={sym}" target="_self">{sym}</a></td>'
+            f'<td class="c-sec" style="color:{sector_color(r["Sector"])}">{r["Sector"]}</td>'
+            f'<td class="c-num">{_fmt(r["Current Price (Rs)"])}</td>'
+            f'<td class="c-num c-muted">{_fmt(r["52 Week High (Rs)"])}</td>'
+            f'<td class="c-num c-rsi" style="color:{rsi_color(rsi)}">{rsi_txt}</td>'
+            f'<td class="c-reco"><span class="pill" '
+            f'style="background:{reco_color(reco)}">{reco}</span></td>'
+            f'<td class="c-num">{_fmt(r["1 Year Target (Rs)"])}</td>'
+            "</tr>")
 
-    picked = []
-    try:
-        picked = list(event.selection.rows)
-    except Exception:
-        pass
-    if picked:
-        sym = str(results.iloc[picked[0]]["Stock Symbol"])
-        if st.session_state.get("opened_for") != sym:
-            st.session_state["opened_for"] = sym
-            detail_dialog(sym)
-    else:
-        st.session_state["opened_for"] = None
+    st.markdown(
+        '<div class="sh-tablewrap"><table class="sh-table"><thead><tr>'
+        + head_html + "</tr></thead><tbody>" + "".join(body_rows)
+        + "</tbody></table></div>", unsafe_allow_html=True)
+    st.markdown('<div class="sh-hint">Click a stock symbol to open its full detail '
+                "— market cap, price levels and a financial-health scorecard.</div>",
+                unsafe_allow_html=True)
 
     st.download_button("Download Excel report", data=to_excel_bytes(results),
                        file_name=f"RSI_Screener_{dt.date.today().isoformat()}.xlsx",
