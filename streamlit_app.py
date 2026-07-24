@@ -15,6 +15,7 @@ import datetime as dt
 import io
 import time
 from collections import Counter
+from urllib.parse import quote
 
 import pandas as pd
 import requests
@@ -46,7 +47,7 @@ HEADERS = [
     "RSI", "Buy/Sell", "1 Year Target (Rs)",
 ]
 
-UNIVERSES = ["NIFTY 50", "NIFTY 500", "All NSE", "My list"]
+UNIVERSES = ["All NIFTY Stocks", "NIFTY 50", "NIFTY 500", "My list"]
 
 _EQUITY_LIST_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 _INDEX500_LIST_URL = "https://niftyindices.com/IndexConstituent/ind_nifty500list.csv"
@@ -95,25 +96,27 @@ h1,h2,h3,h4,h5 { font-family:'Archivo', sans-serif; letter-spacing:-0.02em; }
 .sec-label{ font-size:0.72rem; text-transform:uppercase; letter-spacing:0.09em;
   color:var(--muted); font-weight:600; margin:2px 0 6px; }
 
-.stat{ border-radius:12px; padding:14px 16px; height:100%; border:1px solid var(--line);
+.stat-row{ display:flex; flex-wrap:wrap; gap:10px; margin-bottom:4px; }
+.stat{ flex:1 1 150px; border-radius:12px; padding:11px 13px; border:1px solid var(--line);
   border-top:4px solid var(--teal); background:#FFF; }
+div[role="dialog"]{ max-width:760px !important; }
 .stat.v{ border-top-color:var(--violet); }
 .stat.a{ border-top-color:var(--amber); }
 .stat.b{ border-top-color:var(--blue); }
 .stat.g{ border-top-color:var(--green); }
 .stat-k{ font-size:0.68rem; text-transform:uppercase; letter-spacing:0.08em;
   color:var(--muted); font-weight:600; }
-.stat-v{ font-family:'IBM Plex Mono',monospace; font-size:1.3rem; font-weight:600;
-  margin-top:5px; line-height:1.2; }
+.stat-v{ font-family:'IBM Plex Mono',monospace; font-size:1.1rem; font-weight:600;
+  margin-top:3px; line-height:1.2; }
 .stat-n{ font-size:0.73rem; color:var(--muted); margin-top:3px; }
 
 .score-row{ display:flex; gap:10px; flex-wrap:wrap; margin:6px 0 16px; }
-.score{ flex:1 1 118px; border-radius:10px; padding:13px 15px; color:#FFF; }
+.score{ flex:1 1 118px; border-radius:10px; padding:10px 13px; color:#FFF; }
 .score.pos{ background:var(--green); }
 .score.neu{ background:#6B7A8F; }
 .score.neg{ background:var(--red); }
 .score.nod{ background:#A8B4BF; }
-.score-n{ font-family:'IBM Plex Mono',monospace; font-size:1.7rem; font-weight:600;
+.score-n{ font-family:'IBM Plex Mono',monospace; font-size:1.4rem; font-weight:600;
   line-height:1; }
 .score-l{ font-size:0.75rem; margin-top:5px; opacity:0.92; }
 
@@ -416,6 +419,23 @@ def parse_uploaded_symbols(text: str) -> list[str]:
     return out
 
 
+def tickers_for(universe_choice: str, uploaded: str | None = None) -> list[str]:
+    if universe_choice == "NIFTY 50":
+        return list(NIFTY50)
+    if universe_choice == "NIFTY 500":
+        return load_nifty500_tickers()
+    if universe_choice == "All NIFTY Stocks":
+        return load_all_nse_tickers()
+    return parse_uploaded_symbols(uploaded or "")
+
+
+SCAN_SEP = "|"
+
+
+def _cfg_str(u: str, th, n) -> str:
+    return f"{u}{SCAN_SEP}{th}{SCAN_SEP}{n}"
+
+
 # ----------------------------- data fetching ------------------------------
 
 def fetch_fundamentals(symbol: str) -> dict:
@@ -445,7 +465,7 @@ def fetch_fundamentals(symbol: str) -> dict:
     return {"name": name, "sector": sector, "reco": reco, "target": target}
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_detail(symbol: str) -> dict:
     out = {"name": symbol.replace(".NS", ""), "sector": "n/a", "mcap": None,
            "price": None, "high52": None, "low52": None, "rsi": None,
@@ -493,7 +513,7 @@ def fetch_detail(symbol: str) -> dict:
     return out
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def scan(tickers: tuple[str, ...], threshold: float, fetch_fund_limit: int) -> pd.DataFrame:
     bar = st.progress(0.0, text="Downloading price history...")
     close_map, high_map = {}, {}
@@ -613,16 +633,17 @@ def render_detail(symbol: str):
     rng = f"{d['low52']:,.0f} – {d['high52']:,.0f}" if d["high52"] else "n/a"
     tgt = f"Rs {d['target']:,.2f}" if isinstance(d["target"], (int, float)) else "n/a"
 
-    cards = [
+    cards = "".join([
         _stat("Price", price, "", ""),
         _stat("Market cap", mcap, classify_market_cap(d["mcap"]), "v"),
         _stat("RSI (14d)", rsi,
               "overbought zone" if d["rsi"] and d["rsi"] >= 70 else "momentum", "a"),
         _stat("52-week range", rng, "", "b"),
         _stat("1-year target", tgt, f"consensus: {d['reco']}", "g"),
-    ]
-    for col, card in zip(st.columns(5), cards):
-        col.markdown(card, unsafe_allow_html=True)
+    ])
+    st.markdown(f'<div class="stat-row">{cards}</div>', unsafe_allow_html=True)
+    st.caption(f"Live price as of {dt.datetime.now().strftime('%d %b %Y, %H:%M')} "
+               "(server time).")
 
     st.write("")
     tab_levels, tab_health = st.tabs(["Price levels", "Financial health"])
@@ -749,7 +770,7 @@ universe_choice = st.session_state["universe"]
 uploaded = None
 if universe_choice == "My list":
     uploaded = st.text_area("Symbols, one per line", placeholder="RELIANCE\nTCS\nINFY",
-                            height=90)
+                            height=90, key="mylist_text")
 
 c1, c2, c3, c4 = st.columns([3, 2, 1, 1])
 threshold = c1.slider("RSI at or above", 50, 90, 65, 1)
@@ -759,9 +780,9 @@ run = c3.button("Run screen", type="primary", use_container_width=True)
 c4.write("")
 clear = c4.button("Clear", use_container_width=True)
 
-if universe_choice == "All NSE":
-    st.caption("Full NSE pulls ~2000 stocks and can take several minutes. "
-               "NIFTY 500 is the better broad option for daily use.")
+if universe_choice == "All NIFTY Stocks":
+    st.caption("All NIFTY Stocks pulls ~2000 listed stocks and can take several "
+               "minutes. NIFTY 500 is the better broad option for daily use.")
 
 if clear:
     for k in ("results", "scanned", "threshold", "opened_for", "screener_table",
@@ -771,28 +792,39 @@ if clear:
     st.rerun()
 
 if run:
-    if universe_choice == "NIFTY 50":
-        tickers = NIFTY50
-    elif universe_choice == "NIFTY 500":
-        tickers = load_nifty500_tickers()
-        if not tickers:
-            st.error("The NIFTY 500 list did not load. Try again in a minute, or use "
-                     "My list.")
-            st.stop()
-    elif universe_choice == "All NSE":
-        tickers = load_all_nse_tickers()
-        if not tickers:
-            st.error("The NSE list did not load. Try again in a minute, or use My list.")
-            st.stop()
-    else:
-        tickers = parse_uploaded_symbols(uploaded or "")
-        if not tickers:
+    tickers = tickers_for(universe_choice, uploaded)
+    if not tickers:
+        if universe_choice == "My list":
             st.warning("Add at least one symbol to scan.")
-            st.stop()
+        else:
+            st.error(f"The {universe_choice} list did not load. Try again in a "
+                     "minute, or use My list.")
+        st.stop()
     st.session_state["results"] = scan(tuple(tickers), float(threshold), int(fetch_limit))
     st.session_state["scanned"] = len(tickers)
     st.session_state["threshold"] = threshold
     st.session_state["opened_for"] = None
+    st.query_params["scan"] = _cfg_str(universe_choice, threshold, int(fetch_limit))
+    if "stock" in st.query_params:
+        del st.query_params["stock"]
+    st.session_state.pop("qp_opened", None)
+
+# restore the results table after a ?stock= hyperlink reload (cached -> instant)
+if st.session_state.get("results") is None:
+    _cfg = st.query_params.get("scan")
+    if _cfg:
+        try:
+            _u, _th, _n = _cfg.split(SCAN_SEP)
+            _th, _n = float(_th), int(_n)
+            if _u != "My list":
+                _tks = tickers_for(_u)
+                if _tks:
+                    st.session_state["results"] = scan(tuple(_tks), _th, _n)
+                    st.session_state["scanned"] = len(_tks)
+                    st.session_state["threshold"] = _th
+                    st.session_state["universe"] = _u
+        except Exception:
+            pass
 
 results = st.session_state.get("results")
 
@@ -814,16 +846,18 @@ else:
     head_html = "".join(
         f'<th class="th-{a}">{h}</th>' for h, a in zip(HEADERS, aligns))
 
+    _cfgq = quote(st.query_params.get("scan", ""), safe="")
     body_rows = []
     for _, r in results.iterrows():
         sym = r["Stock Symbol"]
         rsi = r["RSI"]
         reco = r["Buy/Sell"]
         rsi_txt = f"{rsi:.1f}" if isinstance(rsi, (int, float)) else str(rsi)
+        href = f"?scan={_cfgq}&stock={sym}" if _cfgq else f"?stock={sym}"
         body_rows.append(
             "<tr>"
             f'<td class="c-date">{r["Date"]}</td>'
-            f'<td><a class="c-sym" href="?stock={sym}" target="_self">{sym}</a></td>'
+            f'<td><a class="c-sym" href="{href}" target="_self">{sym}</a></td>'
             f'<td class="c-sec" style="color:{sector_color(r["Sector"])}">{r["Sector"]}</td>'
             f'<td class="c-num">{_fmt(r["Current Price (Rs)"])}</td>'
             f'<td class="c-num c-muted">{_fmt(r["52 Week High (Rs)"])}</td>'
