@@ -1,5 +1,5 @@
 """
-StockHunter - NSE RSI Screener
+StockMerit - NSE RSI Screener
 ------------------------------
 Daily screen of NSE stocks by 14-day RSI, with a per-stock detail view
 covering market cap, support/resistance and a financial health scorecard.
@@ -47,7 +47,27 @@ HEADERS = [
     "RSI", "Buy/Sell", "1 Year Target (Rs)",
 ]
 
-UNIVERSES = ["All NIFTY Stocks", "NIFTY 50", "NIFTY 500", "My list"]
+UNIVERSES = ["All NIFTY Stocks", "NIFTY 50", "NIFTY 500", "Custom List"]
+
+HEALTH_GROUPS = [
+    ("Cash flow", ["Cash flow backs reported profit", "Operating cash flow positive",
+                   "Free cash flow positive"]),
+    ("Debt & solvency", ["Debt to equity", "Debt reduced vs last year",
+                         "Interest coverage", "Current ratio"]),
+    ("Efficiency", ["Receivables in line with sales", "Inventory in line with sales"]),
+    ("Growth", ["Revenue growing (3y)", "Profit growing (3y)",
+                "Profitable every year (3y)"]),
+    ("Profitability", ["Return on equity", "Operating margin holding up",
+                       "Net margin positive"]),
+]
+
+RECO_INFO = {
+    "Strong Buy": "Highest-conviction analyst call — consensus strongly expects the "
+                  "price to rise over the next 12 months.",
+    "Buy": "Analysts expect the price to rise over the next 12 months.",
+    "Hold": "Analysts expect roughly flat performance — wait and watch.",
+    "Sell": "Analysts expect the price to fall — consider trimming or exiting.",
+}
 
 _EQUITY_LIST_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 _INDEX500_LIST_URL = "https://niftyindices.com/IndexConstituent/ind_nifty500list.csv"
@@ -87,7 +107,10 @@ h1,h2,h3,h4,h5 { font-family:'Archivo', sans-serif; letter-spacing:-0.02em; }
   flex-wrap:wrap; gap:12px;
 }
 .band-name{ font-family:'Archivo',sans-serif; font-weight:700; font-size:1.7rem;
-  color:#FFF; letter-spacing:-0.03em; line-height:1.1; }
+  color:#FFF; letter-spacing:-0.03em; line-height:1.1; display:flex; align-items:center; gap:10px; }
+.band-name .brandmark{ width:34px; height:34px; border-radius:8px; background:#FFF;
+  display:inline-flex; align-items:center; justify-content:center; }
+.band-name .m{ color:#5CA8FF; }
 .band-sub{ font-family:'IBM Plex Mono',monospace; font-size:0.78rem;
   color:#B6D8DC; margin-top:6px; }
 .band-date{ font-family:'IBM Plex Mono',monospace; font-size:0.78rem; color:#EAF6F7;
@@ -247,6 +270,10 @@ def reco_color(v) -> str:
     if "hold" in s:
         return "#C77A0B"
     return "#8794A1"
+
+
+def reco_info(v) -> str:
+    return RECO_INFO.get(str(v), "")
 
 
 # --------------------------- health scorecard -----------------------------
@@ -703,11 +730,19 @@ def render_detail(symbol: str):
                 f'<div class="score nod"><div class="score-n">{cnt.get("No Data",0)}</div>'
                 '<div class="score-l">No data</div></div>'
                 '</div>', unsafe_allow_html=True)
-            st.markdown("".join(
-                f'<div class="chk"><span class="tag {c["verdict"].replace(" ","")}">'
-                f'{c["verdict"]}</span><span class="chk-n">{c["name"]}</span>'
-                f'<span class="chk-d">{c["detail"]}</span></div>' for c in checks),
-                unsafe_allow_html=True)
+            st.caption("Grouped by theme — expand a category to see its checks.")
+            by_name = {c["name"]: c for c in checks}
+            for cat, names in HEALTH_GROUPS:
+                gc = [by_name[n] for n in names if n in by_name]
+                if not gc:
+                    continue
+                pos = sum(1 for c in gc if c["verdict"] == "Yes")
+                with st.expander(f"{cat}  ·  {pos}/{len(gc)} positive", expanded=False):
+                    st.markdown("".join(
+                        f'<div class="chk"><span class="tag {c["verdict"].replace(" ","")}">'
+                        f'{c["verdict"]}</span><span class="chk-n">{c["name"]}</span>'
+                        f'<span class="chk-d">{c["detail"]}</span></div>' for c in gc),
+                        unsafe_allow_html=True)
             st.caption("Mechanical checks on reported annual financials. A negative flag "
                        "marks something worth investigating, not a verdict on the company. "
                        "Ratios like debt-to-equity do not carry the same meaning for banks "
@@ -722,12 +757,20 @@ def detail_dialog(symbol: str):
 
 # ---------------------------------- app -----------------------------------
 
-st.set_page_config(page_title="StockHunter — NSE RSI Screener",
+st.set_page_config(page_title="StockMerit — NSE RSI Screener",
                    page_icon="📊", layout="wide")
 st.markdown(CSS, unsafe_allow_html=True)
 
 st.markdown(
-    '<div class="band"><div><div class="band-name">StockHunter</div>'
+    '<div class="band"><div><div class="band-name">'
+    '<span class="brandmark"><svg width="22" height="22" viewBox="0 0 32 32" fill="none">'
+    '<defs><linearGradient id="smg" x1="2" y1="26" x2="30" y2="6" gradientUnits="userSpaceOnUse">'
+    '<stop stop-color="#1B4DB8"/><stop offset="1" stop-color="#3E9BFF"/></linearGradient></defs>'
+    '<path d="M4 22 L13 15 L18 19 L27 8" stroke="url(#smg)" stroke-width="3.4" '
+    'stroke-linecap="round" stroke-linejoin="round"/>'
+    '<path d="M20 8 H28 V16" stroke="url(#smg)" stroke-width="3.4" '
+    'stroke-linecap="round" stroke-linejoin="round"/></svg></span>'
+    'Stock<span class="m">Merit</span></div>'
     '<div class="band-sub">NSE · 14-day RSI screen · click a symbol for detail</div></div>'
     f'<div class="band-date">{dt.date.today().strftime("%d %b %Y")}</div></div>',
     unsafe_allow_html=True)
@@ -743,7 +786,7 @@ with st.sidebar:
                                               type="primary"):
             detail_dialog(picked_search)
     else:
-        typed = st.text_input(" ", placeholder="RELIANCE", label_visibility="collapsed")
+        typed = st.text_input(" ", placeholder="Search Stock", label_visibility="collapsed")
         if st.button("Open detail", use_container_width=True, type="primary") \
                 and typed.strip():
             detail_dialog(typed.strip().upper())
@@ -768,12 +811,12 @@ for col, name in zip(ucols, UNIVERSES):
 universe_choice = st.session_state["universe"]
 
 uploaded = None
-if universe_choice == "My list":
+if universe_choice == "Custom List":
     uploaded = st.text_area("Symbols, one per line", placeholder="RELIANCE\nTCS\nINFY",
                             height=90, key="mylist_text")
 
 c1, c2, c3, c4 = st.columns([3, 2, 1, 1])
-threshold = c1.slider("RSI at or above", 50, 90, 65, 1)
+threshold = c1.slider("RSI at or above", 0, 90, 65, 1)
 fetch_limit = c2.number_input("Load details for top N", 10, 500, 100, 10)
 c3.write("")
 run = c3.button("Run screen", type="primary", use_container_width=True)
@@ -794,11 +837,11 @@ if clear:
 if run:
     tickers = tickers_for(universe_choice, uploaded)
     if not tickers:
-        if universe_choice == "My list":
+        if universe_choice == "Custom List":
             st.warning("Add at least one symbol to scan.")
         else:
             st.error(f"The {universe_choice} list did not load. Try again in a "
-                     "minute, or use My list.")
+                     "minute, or use Custom List.")
         st.stop()
     st.session_state["results"] = scan(tuple(tickers), float(threshold), int(fetch_limit))
     st.session_state["scanned"] = len(tickers)
@@ -816,7 +859,7 @@ if st.session_state.get("results") is None:
         try:
             _u, _th, _n = _cfg.split(SCAN_SEP)
             _th, _n = float(_th), int(_n)
-            if _u != "My list":
+            if _u != "Custom List":
                 _tks = tickers_for(_u)
                 if _tks:
                     st.session_state["results"] = scan(tuple(_tks), _th, _n)
@@ -835,9 +878,14 @@ elif results.empty:
     st.warning(f"Nothing is at RSI {st.session_state.get('threshold', threshold)} or "
                "above right now. Lower the threshold or widen the stock list.")
 else:
-    st.markdown(f"**{len(results)} stocks** at RSI "
-                f"{st.session_state.get('threshold', threshold)} or above, "
-                f"from {st.session_state.get('scanned', 0)} scanned.")
+    hleft, hright = st.columns([3, 1])
+    hleft.markdown(f"**{len(results)} stocks** at RSI "
+                   f"{st.session_state.get('threshold', threshold)} or above, "
+                   f"from {st.session_state.get('scanned', 0)} scanned.")
+    hright.download_button("Download report", data=to_excel_bytes(results),
+                           file_name=f"RSI_Screener_{dt.date.today().isoformat()}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument."
+                                "spreadsheetml.sheet", use_container_width=True)
 
     def _fmt(x):
         return f"{x:,.2f}" if isinstance(x, (int, float)) else str(x)
@@ -862,7 +910,7 @@ else:
             f'<td class="c-num">{_fmt(r["Current Price (Rs)"])}</td>'
             f'<td class="c-num c-muted">{_fmt(r["52 Week High (Rs)"])}</td>'
             f'<td class="c-num c-rsi" style="color:{rsi_color(rsi)}">{rsi_txt}</td>'
-            f'<td class="c-reco"><span class="pill" '
+            f'<td class="c-reco"><span class="pill" title="{reco_info(reco)}" '
             f'style="background:{reco_color(reco)}">{reco}</span></td>'
             f'<td class="c-num">{_fmt(r["1 Year Target (Rs)"])}</td>'
             "</tr>")
@@ -874,11 +922,6 @@ else:
     st.markdown('<div class="sh-hint">Click a stock symbol to open its full detail '
                 "— market cap, price levels and a financial-health scorecard.</div>",
                 unsafe_allow_html=True)
-
-    st.download_button("Download Excel report", data=to_excel_bytes(results),
-                       file_name=f"RSI_Screener_{dt.date.today().isoformat()}.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument."
-                            "spreadsheetml.sheet")
     na = int((results["Buy/Sell"] == "n/a").sum())
     if na:
         st.caption(f"{na} of {len(results)} stocks have no published analyst rating — "
