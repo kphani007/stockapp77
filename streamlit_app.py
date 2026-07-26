@@ -16,6 +16,7 @@ import io
 import time
 from collections import Counter
 from urllib.parse import quote
+import xml.etree.ElementTree as ET
 
 import pandas as pd
 import requests
@@ -43,9 +44,141 @@ NIFTY50 = [
 ]
 
 HEADERS = [
-    "Date", "Stock Symbol", "Sector", "Current Price (Rs)", "52 Week High (Rs)",
-    "RSI", "Buy/Sell", "1 Year Target (Rs)",
+    "Date", "Stock Symbol", "Sector", "Current Price (Rs)", "Volume",
+    "RSI", "Buy/Sell", "52 Week High (Rs)", "1 Year Target (Rs)",
 ]
+
+COL_LABELS = {
+    "Date": "Date", "Stock Symbol": "Stock Symbol", "Sector": "Sector",
+    "Current Price (Rs)": "Current Price", "Volume": "Volume", "RSI": "RSI",
+    "Buy/Sell": "Buy / Sell", "52 Week High (Rs)": "52-Week High",
+    "1 Year Target (Rs)": "1-Year Target",
+}
+
+SAMPLE_OI = [
+    ("RELIANCE", 2960, 1.8, 12450000, 6.2),
+    ("SBIN", 812, 2.1, 8990000, 9.5),
+    ("ICICIBANK", 1248, 1.4, 7640000, 8.7),
+    ("BAJFINANCE", 7240, 3.2, 2110000, 7.8),
+    ("HDFCBANK", 1680, 0.9, 9820000, 4.1),
+    ("TATAMOTORS", 985, -1.2, 6210000, 5.3),
+    ("MARUTI", 12980, -1.5, 640000, 3.1),
+    ("INFY", 1890, -0.6, 5540000, -3.4),
+    ("TATASTEEL", 162, -0.8, 7120000, -2.7),
+    ("AXISBANK", 1156, 0.4, 4380000, -4.9),
+]
+
+OI_SYMBOLS = [s for s, *_ in SAMPLE_OI]
+DHAN_QUOTE_URL = "https://api.dhan.co/v2/marketfeed/quote"
+DHAN_HIST_URL = "https://api.dhan.co/v2/charts/historical"
+DHAN_SCRIP_URL = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
+
+
+def _dhan_creds() -> tuple[str, str]:
+    try:
+        return (str(st.secrets.get("DHAN_CLIENT_ID", "")).strip(),
+                str(st.secrets.get("DHAN_ACCESS_TOKEN", "")).strip())
+    except Exception:
+        return "", ""
+
+
+def _sample_oi() -> list[dict]:
+    return [{"sym": s, "ltp": l, "price_chg": pc, "oi": oi, "oi_chg": oc}
+            for s, l, pc, oi, oc in SAMPLE_OI]
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _dhan_fut_map(symbols: tuple[str, ...]) -> dict:
+    """Map each stock symbol -> nearest NSE stock-future security id (from scrip master)."""
+    try:
+        df = pd.read_csv(DHAN_SCRIP_URL, low_memory=False)
+    except Exception:
+        return {}
+    up = {c.upper(): c for c in df.columns}
+
+    def col(*names):
+        for n in names:
+            if n in up:
+                return up[n]
+        return None
+
+    c_exch = col("SEM_EXM_EXCH_ID", "EXCH_ID")
+    c_instr = col("SEM_INSTRUMENT_NAME", "INSTRUMENT", "SEM_EXCH_INSTRUMENT_TYPE")
+    c_sec = col("SEM_SMST_SECURITY_ID", "SECURITY_ID")
+    c_exp = col("SEM_EXPIRY_DATE", "EXPIRY")
+    c_und = col("SM_SYMBOL_NAME", "SEM_UNDERLYING_SYMBOL", "UNDERLYING_SYMBOL",
+                "SEM_TRADING_SYMBOL")
+    if not all([c_exch, c_instr, c_sec, c_und]):
+        return {}
+    try:
+        d = df[(df[c_exch].astype(str) == "NSE")
+               & (df[c_instr].astype(str).str.contains("FUTSTK", case=False, na=False))]
+        out = {}
+        for s in symbols:
+            rows = d[d[c_und].astype(str).str.upper() == s]
+            if rows.empty:
+                continue
+            if c_exp:
+                rows = rows.sort_values(c_exp)
+            out[s] = int(rows.iloc[0][c_sec])
+        return out
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_oi_buildup() -> tuple[list[dict], bool]:
+    """Return (rows, is_live). Uses Dhan when a token is configured, else sample data."""
+    cid, tok = _dhan_creds()
+    if not cid or not tok:
+        return _sample_oi(), False
+    try:
+        secmap = _dhan_fut_map(tuple(OI_SYMBOLS))
+        if not secmap:
+            return _sample_oi(), False
+        headers = {"access-token": tok, "client-id": cid,
+                   "Content-Type": "application/json", "Accept": "application/json"}
+        ids = list(secmap.values())
+        q = requests.post(DHAN_QUOTE_URL, json={"NSE_FNO": ids},
+                          headers=headers, timeout=8).json()
+        qmap = (q.get("data") or {}).get("NSE_FNO") or {}
+        today = dt.date.today()
+        frm = (today - dt.timedelta(days=12)).isoformat()
+        rows = []
+        for sym, sid in secmap.items():
+            qd = qmap.get(str(sid)) or {}
+            ltp = qd.get("last_price", qd.get("ltp"))
+            oi = qd.get("oi")
+            hb = requests.post(DHAN_HIST_URL, headers=headers, timeout=8, json={
+                "securityId": str(sid), "exchangeSegment": "NSE_FNO",
+                "instrument": "FUTSTK", "expiryCode": 0,
+                "fromDate": frm, "toDate": today.isoformat()}).json()
+            closes = hb.get("close") or []
+            ois = hb.get("open_interest") or hb.get("openInterest") or []
+            if ltp is None and closes:
+                ltp = closes[-1]
+            if oi is None and ois:
+                oi = ois[-1]
+            prev_close = closes[-2] if len(closes) >= 2 else None
+            prev_oi = ois[-2] if len(ois) >= 2 else None
+            if None in (ltp, oi, prev_close, prev_oi) or not prev_close or not prev_oi:
+                continue
+            rows.append({"sym": sym, "ltp": float(ltp),
+                         "price_chg": (float(ltp) / float(prev_close) - 1) * 100,
+                         "oi": int(oi),
+                         "oi_chg": (float(oi) / float(prev_oi) - 1) * 100})
+        if not rows:
+            return _sample_oi(), False
+        rows.sort(key=lambda r: r["oi_chg"], reverse=True)
+        return rows, True
+    except Exception:
+        return _sample_oi(), False
+
+
+def oi_signal(price_chg: float, oi_chg: float) -> tuple[str, str]:
+    if oi_chg >= 0:
+        return ("Long Buildup", "#0B7A4B") if price_chg >= 0 else ("Short Buildup", "#B3261E")
+    return ("Short Covering", "#0E7C86") if price_chg >= 0 else ("Long Unwinding", "#C77A0B")
 
 UNIVERSES = ["All NIFTY Stocks", "NIFTY 50", "NIFTY 500", "Custom List"]
 
@@ -113,6 +246,10 @@ h1,h2,h3,h4,h5 { font-family:'Archivo', sans-serif; letter-spacing:-0.02em; }
 .band-name .m{ color:#5CA8FF; }
 .band-sub{ font-family:'IBM Plex Mono',monospace; font-size:0.78rem;
   color:#B6D8DC; margin-top:6px; }
+.idxcard{ background:#FFF; border:1px solid #DDE6ED; border-radius:12px; padding:11px 14px; }
+.idx-n{ font-size:0.66rem; text-transform:uppercase; letter-spacing:0.06em; color:#5E6E7E; font-weight:600; }
+.idx-v{ font-family:'IBM Plex Mono',monospace; font-size:1.0rem; font-weight:600; margin-top:4px; }
+.idx-c{ font-family:'IBM Plex Mono',monospace; font-size:0.74rem; font-weight:600; margin-top:2px; }
 .band-date{ font-family:'IBM Plex Mono',monospace; font-size:0.78rem; color:#EAF6F7;
   background:rgba(255,255,255,0.14); border-radius:999px; padding:6px 14px; }
 
@@ -186,6 +323,8 @@ div[role="dialog"]{ max-width:760px !important; }
 .sh-table a.c-sym{ font-family:'IBM Plex Mono',monospace; font-weight:600; font-size:0.86rem;
   color:var(--teal); text-decoration:none; }
 .sh-table a.c-sym:hover{ text-decoration:underline; }
+.sh-table .c-price{ text-decoration:underline dotted; text-underline-offset:3px;
+  text-decoration-color:#9BB4C4; cursor:help; }
 .sh-table .c-sec{ font-weight:500; }
 .sh-table .c-num{ font-family:'IBM Plex Mono',monospace; text-align:right; }
 .sh-table .c-muted{ color:var(--muted); }
@@ -540,10 +679,51 @@ def fetch_detail(symbol: str) -> dict:
     return out
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_news(limit: int = 8) -> list[dict]:
+    """Latest market headlines from public RSS feeds (headline + link only)."""
+    feeds = [
+        ("Economic Times", "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"),
+        ("Moneycontrol", "https://www.moneycontrol.com/rss/marketreports.xml"),
+        ("Business Standard", "https://www.business-standard.com/rss/markets-106.rss"),
+    ]
+    out = []
+    for source, url in feeds:
+        try:
+            r = requests.get(url, timeout=6, headers={"User-Agent": "Mozilla/5.0"})
+            root = ET.fromstring(r.content)
+            for item in root.iter("item"):
+                title = (item.findtext("title") or "").strip()
+                link = (item.findtext("link") or "").strip()
+                if title and link:
+                    out.append({"title": title, "url": link, "source": source})
+        except Exception:
+            continue
+    return out[:limit]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_indices() -> list[dict]:
+    specs = [("NIFTY 50", "^NSEI"), ("SENSEX", "^BSESN"),
+             ("BANK NIFTY", "^NSEBANK"), ("NIFTY IT", "^CNXIT"),
+             ("NIFTY MIDCAP 100", "^NSEMDCP50")]
+    out = []
+    for name, tk in specs:
+        try:
+            h = yf.Ticker(tk).history(period="5d")["Close"].dropna()
+            if len(h) >= 2:
+                val = float(h.iloc[-1])
+                chg = (val / float(h.iloc[-2]) - 1) * 100
+                out.append({"name": name, "value": val, "chg": chg})
+        except Exception:
+            continue
+    return out
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def scan(tickers: tuple[str, ...], threshold: float, fetch_fund_limit: int) -> pd.DataFrame:
     bar = st.progress(0.0, text="Downloading price history...")
-    close_map, high_map = {}, {}
+    close_map, high_map, vol_map = {}, {}, {}
     batch, n = 200, len(tickers)
     for i in range(0, n, batch):
         chunk = list(tickers[i:i + batch])
@@ -557,6 +737,8 @@ def scan(tickers: tuple[str, ...], threshold: float, fetch_fund_limit: int) -> p
                     continue
                 close_map[sym] = c
                 high_map[sym] = float(df["High"].dropna().max())
+                v = df["Volume"].dropna() if "Volume" in df else None
+                vol_map[sym] = float(v.iloc[-1]) if v is not None and not v.empty else None
             except Exception:
                 continue
         bar.progress(min((i + batch) / n, 1.0), text=f"Downloaded {min(i+batch, n)}/{n} stocks")
@@ -589,6 +771,7 @@ def scan(tickers: tuple[str, ...], threshold: float, fetch_fund_limit: int) -> p
             "Stock Symbol": sym.replace(".NS", ""),
             "Sector": f["sector"],
             "Current Price (Rs)": round(price, 2),
+            "Volume": vol_map.get(sym),
             "52 Week High (Rs)": round(high52, 2) if high52 else None,
             "RSI": round(rsi, 1),
             "Buy/Sell": f["reco"],
@@ -622,19 +805,22 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
         i = ws.max_row
         for cell in ws[i]:
             cell.font = bfont
-        for col in (4, 5, 8):
+        for col in (4, 8, 9):
             c = ws.cell(row=i, column=col)
             if isinstance(c.value, (int, float)):
                 c.number_format = "#,##0.00"
+        vcell = ws.cell(row=i, column=5)
+        if isinstance(vcell.value, (int, float)):
+            vcell.number_format = "#,##0"
         ws.cell(row=i, column=6).number_format = "0.0"
         if isinstance(r["RSI"], (int, float)) and r["RSI"] >= 70:
             for cell in ws[i]:
                 cell.fill = hot
 
-    for i, w in enumerate([12, 16, 22, 16, 16, 8, 14, 16], start=1):
+    for i, w in enumerate([12, 16, 22, 16, 14, 8, 14, 16, 16], start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:H{max(ws.max_row, 2)}"
+    ws.auto_filter.ref = f"A1:I{max(ws.max_row, 2)}"
     ws.cell(row=ws.max_row + 2, column=1, value="Disclaimer: " + DISCLAIMER).font = \
         Font(name="Arial", italic=True, size=9)
 
@@ -780,13 +966,51 @@ st.markdown(
     '<path d="M20 8 H28 V16" stroke="url(#smg)" stroke-width="3.4" '
     'stroke-linecap="round" stroke-linejoin="round"/></svg></span>'
     'Stock<span class="m">Merit</span></div>'
-    '<div class="band-sub">NSE · 14-day RSI screen · click a symbol for detail</div></div>'
+    '<div class="band-sub">NSE · 14-day RSI screen · Click any row for the stock details</div></div>'
     f'<div class="band-date">{dt.date.today().strftime("%d %b %Y")}</div></div>',
     unsafe_allow_html=True)
 
-# --- sidebar: search only ---
+_idx = fetch_indices()
+if _idx:
+    for _c, _ix in zip(st.columns(len(_idx)), _idx):
+        _clr = "#0B7A4B" if _ix["chg"] >= 0 else "#B3261E"
+        _arr = "▲ +" if _ix["chg"] >= 0 else "▼ "
+        _c.markdown(
+            f'<div class="idxcard"><div class="idx-n">{_ix["name"]}</div>'
+            f'<div class="idx-v">{_ix["value"]:,.2f}</div>'
+            f'<div class="idx-c" style="color:{_clr}">{_arr}{abs(_ix["chg"]):.2f}%</div></div>',
+            unsafe_allow_html=True)
+
+with st.expander("Stock OI — open-interest buildup", expanded=False):
+    _oi_rows_data, _oi_live = get_oi_buildup()
+    st.caption(("Live via Dhan API. " if _oi_live else "Sample data — add your Dhan "
+                "token in app secrets for live values. ")
+               + "Rise in OI with rise in price = long buildup.")
+    _oi_head = "".join(f'<th class="th-{a}">{h}</th>' for h, a in [
+        ("Stock Symbol", "l"), ("LTP", "r"), ("Rise In Price", "r"),
+        ("Open Interest", "r"), ("Rise In OI", "r"), ("Signal", "c")])
+    _oi_rows = []
+    for _r in _oi_rows_data:
+        _pc, _oc = _r["price_chg"], _r["oi_chg"]
+        _sig, _sc = oi_signal(_pc, _oc)
+        _pcl = "#0B7A4B" if _pc >= 0 else "#B3261E"
+        _ocl = "#0B7A4B" if _oc >= 0 else "#B3261E"
+        _oi_rows.append(
+            "<tr>"
+            f'<td><a class="c-sym">{_r["sym"]}</a></td>'
+            f'<td class="c-num">{_r["ltp"]:,.2f}</td>'
+            f'<td class="c-num" style="color:{_pcl};font-weight:600">{_pc:+.2f}%</td>'
+            f'<td class="c-num c-muted">{int(_r["oi"]):,}</td>'
+            f'<td class="c-num" style="color:{_ocl};font-weight:600">{_oc:+.2f}%</td>'
+            f'<td class="c-reco"><span class="pill" style="background:{_sc}">{_sig}</span></td>'
+            "</tr>")
+    st.markdown(
+        '<div class="sh-tablewrap"><table class="sh-table"><thead><tr>'
+        + _oi_head + "</tr></thead><tbody>" + "".join(_oi_rows)
+        + "</tbody></table></div>", unsafe_allow_html=True)
+
+# --- sidebar: search + custom list ---
 with st.sidebar:
-    st.markdown("### Stock Search")
     all_syms = load_all_nse_tickers()
     if all_syms:
         opts = [s.replace(".NS", "") for s in all_syms]
@@ -800,6 +1024,40 @@ with st.sidebar:
         if st.button("Open detail", use_container_width=True, type="primary") \
                 and typed.strip():
             detail_dialog(typed.strip().upper())
+    sidebar_custom = st.container()
+    st.session_state.setdefault("watchlist", [])
+    st.markdown("**Watchlist**")
+    wl_add = st.text_input(" ", placeholder="Add symbol to watchlist",
+                           key="wl_add_input", label_visibility="collapsed")
+    if st.button("Add to watchlist", use_container_width=True) and wl_add.strip():
+        _s = wl_add.strip().upper()
+        if _s not in st.session_state["watchlist"]:
+            st.session_state["watchlist"].append(_s)
+        st.rerun()
+    for _s in list(st.session_state["watchlist"]):
+        _wa, _wb = st.columns([3, 1])
+        if _wa.button(_s, key=f"wl_open_{_s}", use_container_width=True):
+            detail_dialog(_s)
+        if _wb.button("✕", key=f"wl_rm_{_s}"):
+            st.session_state["watchlist"].remove(_s)
+            st.rerun()
+    if st.session_state["watchlist"] and st.button("Clear watchlist",
+                                                   use_container_width=True):
+        st.session_state["watchlist"] = []
+        st.rerun()
+    st.markdown("---")
+    st.markdown("**Financial news**")
+    _news = fetch_news(7)
+    if _news:
+        for _n in _news:
+            st.markdown(
+                f'<a href="{_n["url"]}" target="_blank" style="font-size:0.82rem; '
+                f'line-height:1.3; display:block;">{_n["title"]}</a>'
+                f'<div style="font-size:0.66rem; color:#8794A1; margin:2px 0 9px;">'
+                f'{_n["source"]}</div>', unsafe_allow_html=True)
+        st.caption("Headlines from public RSS feeds — click to read at the source.")
+    else:
+        st.caption("News feed unavailable right now.")
 
 # --- hyperlink handler: ?stock=SYMBOL opens the dialog ---
 qp_stock = st.query_params.get("stock")
@@ -822,8 +1080,10 @@ universe_choice = st.session_state["universe"]
 
 uploaded = None
 if universe_choice == "Custom List":
-    uploaded = st.text_area("Symbols, one per line", placeholder="RELIANCE\nTCS\nINFY",
-                            height=90, key="mylist_text")
+    with sidebar_custom:
+        st.markdown("**Custom List**")
+        uploaded = st.text_area("Symbols, one per line", placeholder="RELIANCE\nTCS\nINFY",
+                                height=90, key="mylist_text", label_visibility="collapsed")
 
 st.session_state.setdefault("rsi_thr", 65)
 c1, c2, c3, c4 = st.columns([3, 2, 1, 1])
@@ -902,9 +1162,9 @@ else:
     def _fmt(x):
         return f"{x:,.2f}" if isinstance(x, (int, float)) else str(x)
 
-    aligns = ["l", "l", "l", "r", "r", "r", "c", "r"]
+    aligns = ["l", "l", "l", "r", "r", "r", "c", "r", "r"]
     head_html = "".join(
-        f'<th class="th-{a}">{h}</th>' for h, a in zip(HEADERS, aligns))
+        f'<th class="th-{a}">{COL_LABELS.get(h, h)}</th>' for h, a in zip(HEADERS, aligns))
 
     _cfgq = quote(st.query_params.get("scan", ""), safe="")
     body_rows = []
@@ -915,6 +1175,7 @@ else:
         rsi_txt = f"{rsi:.1f}" if isinstance(rsi, (int, float)) else str(rsi)
         href = f"?scan={_cfgq}&stock={sym}" if _cfgq else f"?stock={sym}"
         _sv = lambda v: f"{v:,.2f}" if isinstance(v, (int, float)) else "n/a"
+        _vol = lambda v: f"{int(v):,}" if isinstance(v, (int, float)) else "n/a"
         sma_tip = (f"20-day SMA: {_sv(r.get('_SMA20'))}  |  "
                    f"50-day SMA: {_sv(r.get('_SMA50'))}  |  "
                    f"200-day SMA: {_sv(r.get('_SMA200'))}")
@@ -923,21 +1184,22 @@ else:
             f'<td class="c-date">{r["Date"]}</td>'
             f'<td><a class="c-sym" href="{href}" target="_self">{sym}</a></td>'
             f'<td class="c-sec" style="color:{sector_color(r["Sector"])}">{r["Sector"]}</td>'
-            f'<td class="c-num" title="{sma_tip}">{_fmt(r["Current Price (Rs)"])}</td>'
-            f'<td class="c-num c-muted">{_fmt(r["52 Week High (Rs)"])}</td>'
+            f'<td class="c-num c-price" title="{sma_tip}">{_fmt(r["Current Price (Rs)"])}</td>'
+            f'<td class="c-num c-muted">{_vol(r.get("Volume"))}</td>'
             f'<td class="c-num c-rsi" style="color:{rsi_color(rsi)}">{rsi_txt}</td>'
             f'<td class="c-reco"><span class="pill" title="{reco_info(reco)}" '
             f'style="background:{reco_color(reco)}">{reco}</span></td>'
+            f'<td class="c-num c-muted">{_fmt(r["52 Week High (Rs)"])}</td>'
             f'<td class="c-num">{_fmt(r["1 Year Target (Rs)"])}</td>'
             "</tr>")
 
+    st.markdown('<div class="sh-hint">Click a stock symbol for its full detail. '
+                "Hover the underlined price to see 20 / 50 / 200-day moving averages."
+                "</div>", unsafe_allow_html=True)
     st.markdown(
         '<div class="sh-tablewrap"><table class="sh-table"><thead><tr>'
         + head_html + "</tr></thead><tbody>" + "".join(body_rows)
         + "</tbody></table></div>", unsafe_allow_html=True)
-    st.markdown('<div class="sh-hint">Click a stock symbol to open its full detail '
-                "— market cap, price levels and a financial-health scorecard.</div>",
-                unsafe_allow_html=True)
     na = int((results["Buy/Sell"] == "n/a").sum())
     if na:
         st.caption(f"{na} of {len(results)} stocks have no published analyst rating — "
