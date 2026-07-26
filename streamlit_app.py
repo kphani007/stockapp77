@@ -970,19 +970,71 @@ st.markdown(
     f'<div class="band-date">{dt.date.today().strftime("%d %b %Y")}</div></div>',
     unsafe_allow_html=True)
 
-_idx = fetch_indices()
-if _idx:
-    for _c, _ix in zip(st.columns(len(_idx)), _idx):
-        _clr = "#0B7A4B" if _ix["chg"] >= 0 else "#B3261E"
-        _arr = "▲ +" if _ix["chg"] >= 0 else "▼ "
-        _c.markdown(
-            f'<div class="idxcard"><div class="idx-n">{_ix["name"]}</div>'
-            f'<div class="idx-v">{_ix["value"]:,.2f}</div>'
-            f'<div class="idx-c" style="color:{_clr}">{_arr}{abs(_ix["chg"]):.2f}%</div></div>',
-            unsafe_allow_html=True)
+# --- sidebar: search + custom list ---
+with st.sidebar:
+    all_syms = load_all_nse_tickers()
+    if all_syms:
+        opts = [s.replace(".NS", "") for s in all_syms]
+        picked_search = st.selectbox(" ", opts, index=None, placeholder="Search Stock",
+                                     label_visibility="collapsed")
+        if picked_search and st.button("Open detail", use_container_width=True,
+                                       type="primary"):
+            detail_dialog(picked_search)
+    else:
+        typed = st.text_input(" ", placeholder="Search Stock", label_visibility="collapsed")
+        if st.button("Open detail", use_container_width=True, type="primary") \
+                and typed.strip():
+            detail_dialog(typed.strip().upper())
+    sidebar_custom = st.container()
+    st.session_state.setdefault("watchlist", [])
+    st.markdown("**Watchlist**")
+    if all_syms:
+        wl_pick = st.selectbox(" ", opts, index=None, placeholder="Add a stock",
+                               key="wl_pick", label_visibility="collapsed")
+        _wl_val = wl_pick
+    else:
+        _wl_txt = st.text_input(" ", placeholder="Add symbol to watchlist",
+                                key="wl_add_input", label_visibility="collapsed")
+        _wl_val = _wl_txt.strip().upper() if _wl_txt else None
+    if st.button("Add to watchlist", use_container_width=True) and _wl_val:
+        if _wl_val not in st.session_state["watchlist"]:
+            st.session_state["watchlist"].append(_wl_val)
+        st.rerun()
+    for _s in list(st.session_state["watchlist"]):
+        _wa, _wb = st.columns([3, 1])
+        if _wa.button(_s, key=f"wl_open_{_s}", use_container_width=True):
+            detail_dialog(_s)
+        if _wb.button("✕", key=f"wl_rm_{_s}"):
+            st.session_state["watchlist"].remove(_s)
+            st.rerun()
+    if st.session_state["watchlist"] and st.button("Clear watchlist",
+                                                   use_container_width=True):
+        st.session_state["watchlist"] = []
+        st.rerun()
 
-with st.expander("Stock OI — open-interest buildup", expanded=False):
+# --- top nav: Screener / News / Stock OI ---
+st.session_state.setdefault("view", "Screener")
+view = st.radio("view", ["Screener", "News", "Stock OI"],
+                horizontal=True, label_visibility="collapsed", key="view")
+
+if view == "News":
+    st.markdown("### Financial news")
+    _news = fetch_news(14)
+    if _news:
+        for _n in _news:
+            st.markdown(
+                f'<a href="{_n["url"]}" target="_blank" style="font-size:0.95rem; '
+                f'font-weight:600; line-height:1.35; display:block;">{_n["title"]}</a>'
+                f'<div style="font-size:0.74rem; color:#0E7C86; margin:2px 0 12px;">'
+                f'{_n["source"]}</div>', unsafe_allow_html=True)
+        st.caption("Headlines from public RSS feeds — click to read at the source.")
+    else:
+        st.info("News feed unavailable right now.")
+    st.stop()
+
+if view == "Stock OI":
     _oi_rows_data, _oi_live = get_oi_buildup()
+    st.markdown("### Open interest — buildup")
     st.caption(("Live via Dhan API. " if _oi_live else "Sample data — add your Dhan "
                 "token in app secrets for live values. ")
                + "Rise in OI with rise in price = long buildup.")
@@ -1008,56 +1060,19 @@ with st.expander("Stock OI — open-interest buildup", expanded=False):
         '<div class="sh-tablewrap"><table class="sh-table"><thead><tr>'
         + _oi_head + "</tr></thead><tbody>" + "".join(_oi_rows)
         + "</tbody></table></div>", unsafe_allow_html=True)
+    st.stop()
 
-# --- sidebar: search + custom list ---
-with st.sidebar:
-    all_syms = load_all_nse_tickers()
-    if all_syms:
-        opts = [s.replace(".NS", "") for s in all_syms]
-        picked_search = st.selectbox(" ", opts, index=None, placeholder="Search Stock",
-                                     label_visibility="collapsed")
-        if picked_search and st.button("Open detail", use_container_width=True,
-                                       type="primary"):
-            detail_dialog(picked_search)
-    else:
-        typed = st.text_input(" ", placeholder="Search Stock", label_visibility="collapsed")
-        if st.button("Open detail", use_container_width=True, type="primary") \
-                and typed.strip():
-            detail_dialog(typed.strip().upper())
-    sidebar_custom = st.container()
-    st.session_state.setdefault("watchlist", [])
-    st.markdown("**Watchlist**")
-    wl_add = st.text_input(" ", placeholder="Add symbol to watchlist",
-                           key="wl_add_input", label_visibility="collapsed")
-    if st.button("Add to watchlist", use_container_width=True) and wl_add.strip():
-        _s = wl_add.strip().upper()
-        if _s not in st.session_state["watchlist"]:
-            st.session_state["watchlist"].append(_s)
-        st.rerun()
-    for _s in list(st.session_state["watchlist"]):
-        _wa, _wb = st.columns([3, 1])
-        if _wa.button(_s, key=f"wl_open_{_s}", use_container_width=True):
-            detail_dialog(_s)
-        if _wb.button("✕", key=f"wl_rm_{_s}"):
-            st.session_state["watchlist"].remove(_s)
-            st.rerun()
-    if st.session_state["watchlist"] and st.button("Clear watchlist",
-                                                   use_container_width=True):
-        st.session_state["watchlist"] = []
-        st.rerun()
-    st.markdown("---")
-    st.markdown("**Financial news**")
-    _news = fetch_news(7)
-    if _news:
-        for _n in _news:
-            st.markdown(
-                f'<a href="{_n["url"]}" target="_blank" style="font-size:0.82rem; '
-                f'line-height:1.3; display:block;">{_n["title"]}</a>'
-                f'<div style="font-size:0.66rem; color:#8794A1; margin:2px 0 9px;">'
-                f'{_n["source"]}</div>', unsafe_allow_html=True)
-        st.caption("Headlines from public RSS feeds — click to read at the source.")
-    else:
-        st.caption("News feed unavailable right now.")
+# --- Screener view ---
+_idx = fetch_indices()
+if _idx:
+    for _c, _ix in zip(st.columns(len(_idx)), _idx):
+        _clr = "#0B7A4B" if _ix["chg"] >= 0 else "#B3261E"
+        _arr = "▲ +" if _ix["chg"] >= 0 else "▼ "
+        _c.markdown(
+            f'<div class="idxcard"><div class="idx-n">{_ix["name"]}</div>'
+            f'<div class="idx-v">{_ix["value"]:,.2f}</div>'
+            f'<div class="idx-c" style="color:{_clr}">{_arr}{abs(_ix["chg"]):.2f}%</div></div>',
+            unsafe_allow_html=True)
 
 # --- hyperlink handler: ?stock=SYMBOL opens the dialog ---
 qp_stock = st.query_params.get("stock")
@@ -1101,7 +1116,8 @@ if universe_choice == "All NIFTY Stocks":
 
 if clear:
     for k in ("results", "scanned", "threshold", "opened_for", "screener_table",
-              "qp_opened"):
+              "qp_opened", "watchlist", "mylist_text", "rsi_thr", "universe",
+              "wl_pick", "wl_add_input", "view"):
         st.session_state.pop(k, None)
     st.query_params.clear()
     st.rerun()
