@@ -568,6 +568,11 @@ def scan(tickers: tuple[str, ...], threshold: float, fetch_fund_limit: int) -> p
             hits.append((sym, rsi, float(c.iloc[-1]), high_map.get(sym)))
     hits.sort(key=lambda x: x[1], reverse=True)
 
+    def _sma(series, n):
+        if series is None or len(series) < n:
+            return None
+        return round(float(series.rolling(n).mean().iloc[-1]), 2)
+
     rows, total = [], min(len(hits), fetch_fund_limit)
     bar.progress(0.0, text=f"Loading details for {total} matches")
     for idx, (sym, rsi, price, high52) in enumerate(hits):
@@ -578,6 +583,7 @@ def scan(tickers: tuple[str, ...], threshold: float, fetch_fund_limit: int) -> p
         else:
             f = {"name": sym.replace(".NS", ""), "sector": "not loaded",
                  "reco": "not loaded", "target": "not loaded"}
+        cser = close_map.get(sym)
         rows.append({
             "Date": dt.date.today().isoformat(),
             "Stock Symbol": sym.replace(".NS", ""),
@@ -587,9 +593,12 @@ def scan(tickers: tuple[str, ...], threshold: float, fetch_fund_limit: int) -> p
             "RSI": round(rsi, 1),
             "Buy/Sell": f["reco"],
             "1 Year Target (Rs)": f["target"],
+            "_SMA20": _sma(cser, 20),
+            "_SMA50": _sma(cser, 50),
+            "_SMA200": _sma(cser, 200),
         })
     bar.empty()
-    return pd.DataFrame(rows, columns=HEADERS)
+    return pd.DataFrame(rows, columns=HEADERS + ["_SMA20", "_SMA50", "_SMA200"])
 
 
 # --------------------------------- excel ----------------------------------
@@ -780,10 +789,11 @@ with st.sidebar:
     st.markdown("### Stock Search")
     all_syms = load_all_nse_tickers()
     if all_syms:
-        opts = ["—"] + [s.replace(".NS", "") for s in all_syms]
-        picked_search = st.selectbox(" ", opts, label_visibility="collapsed")
-        if picked_search != "—" and st.button("Open detail", use_container_width=True,
-                                              type="primary"):
+        opts = [s.replace(".NS", "") for s in all_syms]
+        picked_search = st.selectbox(" ", opts, index=None, placeholder="Search Stock",
+                                     label_visibility="collapsed")
+        if picked_search and st.button("Open detail", use_container_width=True,
+                                       type="primary"):
             detail_dialog(picked_search)
     else:
         typed = st.text_input(" ", placeholder="Search Stock", label_visibility="collapsed")
@@ -815,8 +825,10 @@ if universe_choice == "Custom List":
     uploaded = st.text_area("Symbols, one per line", placeholder="RELIANCE\nTCS\nINFY",
                             height=90, key="mylist_text")
 
+st.session_state.setdefault("rsi_thr", 65)
 c1, c2, c3, c4 = st.columns([3, 2, 1, 1])
-threshold = c1.slider("RSI at or above", 0, 90, 65, 1)
+threshold = c1.slider(f"RSI at or above — {st.session_state['rsi_thr']}", 0, 90,
+                      key="rsi_thr")
 fetch_limit = c2.number_input("Load details for top N", 10, 500, 100, 10)
 c3.write("")
 run = c3.button("Run screen", type="primary", use_container_width=True)
@@ -902,12 +914,16 @@ else:
         reco = r["Buy/Sell"]
         rsi_txt = f"{rsi:.1f}" if isinstance(rsi, (int, float)) else str(rsi)
         href = f"?scan={_cfgq}&stock={sym}" if _cfgq else f"?stock={sym}"
+        _sv = lambda v: f"{v:,.2f}" if isinstance(v, (int, float)) else "n/a"
+        sma_tip = (f"20-day SMA: {_sv(r.get('_SMA20'))}  |  "
+                   f"50-day SMA: {_sv(r.get('_SMA50'))}  |  "
+                   f"200-day SMA: {_sv(r.get('_SMA200'))}")
         body_rows.append(
             "<tr>"
             f'<td class="c-date">{r["Date"]}</td>'
             f'<td><a class="c-sym" href="{href}" target="_self">{sym}</a></td>'
             f'<td class="c-sec" style="color:{sector_color(r["Sector"])}">{r["Sector"]}</td>'
-            f'<td class="c-num">{_fmt(r["Current Price (Rs)"])}</td>'
+            f'<td class="c-num" title="{sma_tip}">{_fmt(r["Current Price (Rs)"])}</td>'
             f'<td class="c-num c-muted">{_fmt(r["52 Week High (Rs)"])}</td>'
             f'<td class="c-num c-rsi" style="color:{rsi_color(rsi)}">{rsi_txt}</td>'
             f'<td class="c-reco"><span class="pill" title="{reco_info(reco)}" '
