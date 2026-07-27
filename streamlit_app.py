@@ -702,8 +702,18 @@ def fetch_news(limit: int = 8) -> list[dict]:
     return out[:limit]
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_indices() -> list[dict]:
+IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
+
+
+def market_open() -> bool:
+    now = dt.datetime.now(IST)
+    if now.weekday() >= 5:
+        return False
+    return dt.time(9, 15) <= now.time() <= dt.time(15, 30)
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def fetch_indices(bucket: int = 0) -> list[dict]:
     specs = [("NIFTY 50", "^NSEI"), ("SENSEX", "^BSESN"),
              ("BANK NIFTY", "^NSEBANK"), ("NIFTY IT", "^CNXIT"),
              ("NIFTY MIDCAP 100", "^NSEMDCP50")]
@@ -986,6 +996,15 @@ with st.sidebar:
                 and typed.strip():
             detail_dialog(typed.strip().upper())
 
+with st.sidebar:
+    st.markdown("---")
+    st.toggle("Live updates", value=True, key="live_on")
+    if st.session_state.get("live_on"):
+        st.select_slider("Refresh every (sec)", options=[5, 10, 15, 30, 60],
+                         value=15, key="live_every")
+live_on = st.session_state.get("live_on", True)
+live_every = st.session_state.get("live_every", 15)
+
 # --- top nav: Screener / News / Stock OI ---
 st.session_state.setdefault("view", "Screener")
 view = st.radio("view", ["Screener", "News", "Stock OI"],
@@ -1037,16 +1056,30 @@ if view == "Stock OI":
     st.stop()
 
 # --- Screener view ---
-_idx = fetch_indices()
-if _idx:
-    for _c, _ix in zip(st.columns(len(_idx)), _idx):
-        _clr = "#0B7A4B" if _ix["chg"] >= 0 else "#B3261E"
-        _arr = "▲ +" if _ix["chg"] >= 0 else "▼ "
-        _c.markdown(
-            f'<div class="idxcard"><div class="idx-n">{_ix["name"]}</div>'
-            f'<div class="idx-v">{_ix["value"]:,.2f}</div>'
-            f'<div class="idx-c" style="color:{_clr}">{_arr}{abs(_ix["chg"]):.2f}%</div></div>',
-            unsafe_allow_html=True)
+_live_active = live_on and market_open()
+
+@st.fragment(run_every=(live_every if _live_active else None))
+def render_indices_strip():
+    bucket = int(time.time() // max(int(live_every), 5))
+    _idx = fetch_indices(bucket)
+    if _idx:
+        for _c, _ix in zip(st.columns(len(_idx)), _idx):
+            _clr = "#0B7A4B" if _ix["chg"] >= 0 else "#B3261E"
+            _arr = "▲ +" if _ix["chg"] >= 0 else "▼ "
+            _c.markdown(
+                f'<div class="idxcard"><div class="idx-n">{_ix["name"]}</div>'
+                f'<div class="idx-v">{_ix["value"]:,.2f}</div>'
+                f'<div class="idx-c" style="color:{_clr}">{_arr}{abs(_ix["chg"]):.2f}%</div></div>',
+                unsafe_allow_html=True)
+    _ts = dt.datetime.now(IST).strftime("%H:%M:%S")
+    if _live_active:
+        st.caption(f"🟢 Live · updated {_ts} IST · refreshing every {int(live_every)}s")
+    elif live_on:
+        st.caption(f"⚪ Market closed · showing last close ({_ts} IST)")
+    else:
+        st.caption(f"⏸ Live updates paused · {_ts} IST")
+
+render_indices_strip()
 
 # --- hyperlink handler: ?stock=SYMBOL opens the dialog ---
 qp_stock = st.query_params.get("stock")
