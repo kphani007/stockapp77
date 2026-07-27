@@ -180,7 +180,7 @@ def oi_signal(price_chg: float, oi_chg: float) -> tuple[str, str]:
         return ("Long Buildup", "#0B7A4B") if price_chg >= 0 else ("Short Buildup", "#B3261E")
     return ("Short Covering", "#0E7C86") if price_chg >= 0 else ("Long Unwinding", "#C77A0B")
 
-UNIVERSES = ["All NIFTY Stocks", "NIFTY 50", "NIFTY 500", "Custom List"]
+UNIVERSES = ["All NIFTY Stocks", "NIFTY 50", "NIFTY 500"]
 
 HEALTH_GROUPS = [
     ("Cash flow", ["Cash flow backs reported profit", "Operating cash flow positive",
@@ -592,7 +592,7 @@ def tickers_for(universe_choice: str, uploaded: str | None = None) -> list[str]:
         return load_nifty500_tickers()
     if universe_choice == "All NIFTY Stocks":
         return load_all_nse_tickers()
-    return parse_uploaded_symbols(uploaded or "")
+    return []
 
 
 SCAN_SEP = "|"
@@ -966,11 +966,11 @@ st.markdown(
     '<path d="M20 8 H28 V16" stroke="url(#smg)" stroke-width="3.4" '
     'stroke-linecap="round" stroke-linejoin="round"/></svg></span>'
     'Stock<span class="m">Merit</span></div>'
-    '<div class="band-sub">NSE · 14-day RSI screen · Click any row for the stock details</div></div>'
+    '<div class="band-sub">Analyze at one place…</div></div>'
     f'<div class="band-date">{dt.date.today().strftime("%d %b %Y")}</div></div>',
     unsafe_allow_html=True)
 
-# --- sidebar: search + custom list ---
+# --- sidebar: search ---
 with st.sidebar:
     all_syms = load_all_nse_tickers()
     if all_syms:
@@ -985,32 +985,6 @@ with st.sidebar:
         if st.button("Open detail", use_container_width=True, type="primary") \
                 and typed.strip():
             detail_dialog(typed.strip().upper())
-    sidebar_custom = st.container()
-    st.session_state.setdefault("watchlist", [])
-    st.markdown("**Watchlist**")
-    if all_syms:
-        wl_pick = st.selectbox(" ", opts, index=None, placeholder="Add a stock",
-                               key="wl_pick", label_visibility="collapsed")
-        _wl_val = wl_pick
-    else:
-        _wl_txt = st.text_input(" ", placeholder="Add symbol to watchlist",
-                                key="wl_add_input", label_visibility="collapsed")
-        _wl_val = _wl_txt.strip().upper() if _wl_txt else None
-    if st.button("Add to watchlist", use_container_width=True) and _wl_val:
-        if _wl_val not in st.session_state["watchlist"]:
-            st.session_state["watchlist"].append(_wl_val)
-        st.rerun()
-    for _s in list(st.session_state["watchlist"]):
-        _wa, _wb = st.columns([3, 1])
-        if _wa.button(_s, key=f"wl_open_{_s}", use_container_width=True):
-            detail_dialog(_s)
-        if _wb.button("✕", key=f"wl_rm_{_s}"):
-            st.session_state["watchlist"].remove(_s)
-            st.rerun()
-    if st.session_state["watchlist"] and st.button("Clear watchlist",
-                                                   use_container_width=True):
-        st.session_state["watchlist"] = []
-        st.rerun()
 
 # --- top nav: Screener / News / Stock OI ---
 st.session_state.setdefault("view", "Screener")
@@ -1094,11 +1068,6 @@ for col, name in zip(ucols, UNIVERSES):
 universe_choice = st.session_state["universe"]
 
 uploaded = None
-if universe_choice == "Custom List":
-    with sidebar_custom:
-        st.markdown("**Custom List**")
-        uploaded = st.text_area("Symbols, one per line", placeholder="RELIANCE\nTCS\nINFY",
-                                height=90, key="mylist_text", label_visibility="collapsed")
 
 st.session_state.setdefault("rsi_thr", 65)
 c1, c2, c3, c4 = st.columns([3, 2, 1, 1])
@@ -1116,8 +1085,7 @@ if universe_choice == "All NIFTY Stocks":
 
 if clear:
     for k in ("results", "scanned", "threshold", "opened_for", "screener_table",
-              "qp_opened", "watchlist", "mylist_text", "rsi_thr", "universe",
-              "wl_pick", "wl_add_input", "view"):
+              "qp_opened", "rsi_thr", "universe", "view"):
         st.session_state.pop(k, None)
     st.query_params.clear()
     st.rerun()
@@ -1125,11 +1093,7 @@ if clear:
 if run:
     tickers = tickers_for(universe_choice, uploaded)
     if not tickers:
-        if universe_choice == "Custom List":
-            st.warning("Add at least one symbol to scan.")
-        else:
-            st.error(f"The {universe_choice} list did not load. Try again in a "
-                     "minute, or use Custom List.")
+        st.error(f"The {universe_choice} list did not load. Try again in a minute.")
         st.stop()
     st.session_state["results"] = scan(tuple(tickers), float(threshold), int(fetch_limit))
     st.session_state["scanned"] = len(tickers)
@@ -1147,13 +1111,12 @@ if st.session_state.get("results") is None:
         try:
             _u, _th, _n = _cfg.split(SCAN_SEP)
             _th, _n = float(_th), int(_n)
-            if _u != "Custom List":
-                _tks = tickers_for(_u)
-                if _tks:
-                    st.session_state["results"] = scan(tuple(_tks), _th, _n)
-                    st.session_state["scanned"] = len(_tks)
-                    st.session_state["threshold"] = _th
-                    st.session_state["universe"] = _u
+            _tks = tickers_for(_u)
+            if _tks:
+                st.session_state["results"] = scan(tuple(_tks), _th, _n)
+                st.session_state["scanned"] = len(_tks)
+                st.session_state["threshold"] = _th
+                st.session_state["universe"] = _u
         except Exception:
             pass
 
