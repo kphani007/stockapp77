@@ -1029,7 +1029,9 @@ st.markdown(
     'stroke-linecap="round" stroke-linejoin="round"/>'
     '<path d="M20 8 H28 V16" stroke="url(#smg)" stroke-width="3.4" '
     'stroke-linecap="round" stroke-linejoin="round"/></svg></span>'
-    'Stock<span class="m" style="color:#fff">Merit</span></div>'
+    '<span style="color:#5CA8FF">Stock</span>'
+    '<span style="color:#FFFFFF">Mer</span>'
+    '<span style="color:#5CA8FF">it</span></div>'
     '<div class="band-sub">Analyze at one place …</div></div>'
     f'<div class="band-date">{dt.date.today().strftime("%d-%m-%Y")}</div></div>',
     unsafe_allow_html=True)
@@ -1157,14 +1159,15 @@ universe_choice = st.session_state["universe"]
 uploaded = None
 
 st.session_state.setdefault("rsi_thr", 65)
-c1, c2, c3, c4 = st.columns([3, 2, 1, 1])
-threshold = c1.slider(f"RSI at or above — {st.session_state['rsi_thr']}", 0, 90,
-                      key="rsi_thr")
-fetch_limit = c2.number_input("Load details for top N", 10, 500, 100, 10)
-c3.write("")
-run = c3.button("Run screen", type="primary", use_container_width=True)
-c4.write("")
-clear = c4.button("Clear", use_container_width=True)
+st.markdown('<div class="sec-label" style="margin-top:16px">Screen filters</div>',
+            unsafe_allow_html=True)
+fc1, fc2 = st.columns([3, 2], gap="large")
+threshold = fc1.slider("RSI at or above", 0, 90, key="rsi_thr")
+fetch_limit = fc2.number_input("Load details for top N matches", 10, 500, 100, 10)
+
+bc1, bc2, _bc3 = st.columns([1, 1, 4], gap="small")
+run = bc1.button("Run screen", type="primary", use_container_width=True)
+clear = bc2.button("Clear", use_container_width=True)
 
 if universe_choice == "All NIFTY Stocks":
     st.caption("All NIFTY Stocks pulls ~2000 listed stocks and can take several "
