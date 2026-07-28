@@ -21,6 +21,7 @@ import xml.etree.ElementTree as ET
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 import yfinance as yf
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -351,6 +352,14 @@ div[role="dialog"] .sec-label{ margin:0 0 4px; }
 .sh-table .pill{ font-family:'IBM Plex Mono',monospace; font-size:0.68rem; font-weight:600;
   padding:3px 9px; border-radius:6px; color:#FFF; white-space:nowrap; }
 .sh-hint{ margin-top:10px; font-size:0.75rem; color:#8794A1; }
+
+/* pull content up + strip default header/sidebar chrome */
+[data-testid="stHeader"]{ background:transparent; height:0; }
+.block-container{ padding-top:1.1rem !important; }
+[data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"]{ display:none !important; }
+/* movable + resizable detail dialog */
+div[role="dialog"]{ resize:both; overflow:auto; min-width:340px; min-height:220px; }
+div[role="dialog"]:hover{ box-shadow:0 20px 60px rgba(17,28,43,0.35); }
 </style>
 """
 
@@ -1025,6 +1034,37 @@ def render_detail(symbol: str):
 @st.dialog("Stock detail", width="small")
 def detail_dialog(symbol: str):
     render_detail(symbol)
+    # make the modal draggable (by its top strip) and resizable
+    components.html('''
+<script>
+(function(){
+  var d = window.parent.document;
+  function init(){
+    var dlg = d.querySelector('div[role="dialog"]');
+    if(!dlg){ return setTimeout(init, 120); }
+    if(dlg.dataset.mv){ return; }
+    dlg.dataset.mv = "1";
+    dlg.style.resize = "both"; dlg.style.overflow = "auto"; dlg.style.position = "fixed";
+    var sx, sy, ox, oy, drag = false;
+    dlg.addEventListener("mousedown", function(e){
+      if(e.target.closest('button,input,a,select,textarea,[role="tab"]')) return;
+      var r = dlg.getBoundingClientRect();
+      if(e.clientY - r.top > 56) return;   // only the top strip is a drag handle
+      drag = true; sx = e.clientX; sy = e.clientY; ox = r.left; oy = r.top;
+      dlg.style.left = ox+"px"; dlg.style.top = oy+"px"; dlg.style.margin = "0";
+      dlg.style.cursor = "grabbing"; e.preventDefault();
+    });
+    d.addEventListener("mousemove", function(e){
+      if(!drag) return;
+      dlg.style.left = (ox + e.clientX - sx)+"px";
+      dlg.style.top  = (oy + e.clientY - sy)+"px";
+    });
+    d.addEventListener("mouseup", function(){ drag = false; dlg.style.cursor = "default"; });
+  }
+  init();
+})();
+</script>
+''', height=0)
 
 
 # ---------------------------------- app -----------------------------------
@@ -1042,9 +1082,9 @@ st.markdown(
     'stroke-linecap="round" stroke-linejoin="round"/>'
     '<path d="M20 8 H28 V16" stroke="url(#smg)" stroke-width="3.4" '
     'stroke-linecap="round" stroke-linejoin="round"/></svg></span>'
-    '<span style="color:#5CA8FF">Stock</span>'
+    '<span style="letter-spacing:-0.02em"><span style="color:#5CA8FF">Stock</span>'
     '<span style="color:#FFFFFF">Mer</span>'
-    '<span style="color:#5CA8FF">it</span></div>'
+    '<span style="color:#5CA8FF">it</span></span></div>'
     '<div class="band-sub">Analyze at one place …</div></div>'
     f'<div class="band-date">{dt.date.today().strftime("%d-%m-%Y")}</div></div>',
     unsafe_allow_html=True)
@@ -1068,16 +1108,15 @@ with _sbox:
             st.session_state["last_search"] = _typed.strip().upper()
             detail_dialog(_typed.strip().upper())
 
-# --- sidebar: live controls ---
-with st.sidebar:
-    st.toggle("Live updates", value=True, key="live_on")
-    if st.session_state.get("live_on"):
-        st.select_slider("Refresh every (sec)", options=[1, 5, 10, 15, 30, 60],
-                         value=1, key="live_every")
-live_on = st.session_state.get("live_on", True)
-live_every = st.session_state.get("live_every", 1)
+# --- live-tick settings (kept in code; no sidebar UI) ---
+live_on = True
+live_every = 1
 
-# --- top nav: Screener / News / Stock OI ---
+# --- top nav: Screener / Stock OI / News ---
+_view_map = {"screener": "Screener", "oi": "Stock OI", "news": "News"}
+_qp_view = str(st.query_params.get("view", "")).lower()
+if _qp_view in _view_map and "view" not in st.session_state:
+    st.session_state["view"] = _view_map[_qp_view]
 st.session_state.setdefault("view", "Screener")
 view = st.radio("view", ["Screener", "Stock OI", "News"],
                 horizontal=True, label_visibility="collapsed", key="view")
@@ -1120,7 +1159,7 @@ if view == "Stock OI":
         _ocl = "#0B7A4B" if _oc >= 0 else "#B3261E"
         _oi_rows.append(
             "<tr>"
-            f'<td><a class="c-sym" href="?stock={_r["sym"]}" target="_self">{_r["sym"]}</a></td>'
+            f'<td><a class="c-sym" href="?view=oi&stock={_r["sym"]}" target="_self">{_r["sym"]}</a></td>'
             f'<td class="c-num">{_r["ltp"]:,.2f}</td>'
             f'<td class="c-num" style="color:{_pcl};font-weight:600">{_pc:+.2f}%</td>'
             f'<td class="c-num c-muted">{int(_r["oi"]):,}</td>'
@@ -1227,7 +1266,7 @@ results = st.session_state.get("results")
 
 if results is None:
     st.info("Pick a stock list, set your RSI threshold, then run the screen. "
-            "You can also look up any single stock from the sidebar.")
+            "You can also look up any single stock from the search box above.")
 elif results.empty:
     st.warning(f"Nothing is at RSI {st.session_state.get('threshold', threshold)} or "
                "above right now. Lower the threshold or widen the stock list.")
