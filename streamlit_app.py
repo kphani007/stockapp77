@@ -27,6 +27,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 RSI_PERIOD = 14
+FUND_LIMIT = 100
 MCAP_LARGE_CR, MCAP_MID_CR, MCAP_SMALL_CR = 20000, 5000, 500
 
 NIFTY50 = [
@@ -52,8 +53,8 @@ COL_LABELS = {
     "Date": "Date", "Stock Symbol": "Stock Symbol", "Sector": "Sector",
     "Current Price (Rs)": "Current Price", "Volume": "Volume", "RSI": "RSI",
     "PE": "PE", "Sec PE": "Sec PE",
-    "Buy/Sell": "Buy / Sell", "52 Week High (Rs)": "52-Week High",
-    "1 Year Target (Rs)": "1-Year Forecast",
+    "Buy/Sell": "Buy/Sell", "52 Week High (Rs)": "52 Week High",
+    "1 Year Target (Rs)": "1 Year Forecast",
 }
 
 SAMPLE_OI = [
@@ -236,13 +237,13 @@ h1,h2,h3,h4,h5 { font-family:'Archivo', sans-serif; letter-spacing:-0.02em; }
 
 .band{
   background:linear-gradient(100deg,#111C2B 0%,#123A44 55%,#0E7C86 100%);
-  border-radius:16px; padding:24px 28px; margin-bottom:16px;
-  display:flex; align-items:flex-end; justify-content:space-between;
-  flex-wrap:wrap; gap:12px;
+  border-radius:14px; padding:14px 22px; margin-bottom:12px;
+  display:flex; align-items:center; justify-content:space-between;
+  flex-wrap:wrap; gap:10px;
 }
-.band-name{ font-family:'Archivo',sans-serif; font-weight:700; font-size:1.7rem;
-  color:#FFF; letter-spacing:-0.03em; line-height:1.1; display:flex; align-items:center; gap:10px; }
-.band-name .brandmark{ width:34px; height:34px; border-radius:8px; background:#FFF;
+.band-name{ font-family:'Archivo',sans-serif; font-weight:700; font-size:1.3rem;
+  color:#FFF; letter-spacing:-0.03em; line-height:1.1; display:flex; align-items:center; gap:8px; }
+.band-name .brandmark{ width:26px; height:26px; border-radius:7px; background:#FFF;
   display:inline-flex; align-items:center; justify-content:center; }
 .band-name .m{ color:#5CA8FF; }
 .band-sub{ font-family:'IBM Plex Mono',monospace; font-size:0.78rem;
@@ -308,7 +309,21 @@ div[role="dialog"]{ max-width:600px !important; }
 
 .disc{ font-size:0.76rem; color:var(--muted); line-height:1.6;
   border-top:1px solid var(--line); padding-top:14px; margin-top:10px; }
-.stButton>button{ border-radius:9px; font-weight:500; }
+.stButton>button{ border-radius:9px; font-weight:500; padding:6px 10px; font-size:0.9rem; }
+.stDownloadButton>button{ background:transparent; color:var(--teal);
+  border:1px solid var(--teal); font-weight:600; border-radius:9px; padding:5px 14px; }
+.stDownloadButton>button:hover{ background:#E3F2F3; color:var(--teal); }
+div[role="dialog"] button[data-baseweb="tab"]{ font-family:'Archivo',sans-serif;
+  font-weight:700; font-size:0.9rem; background:#EEF3F6; border-radius:8px 8px 0 0;
+  padding:6px 18px; margin-right:6px; color:var(--muted); }
+div[role="dialog"] button[data-baseweb="tab"][aria-selected="true"]{
+  background:var(--teal); color:#FFF; }
+div[role="dialog"] div[data-baseweb="tab-highlight"]{ display:none; }
+div[role="dialog"] div[data-baseweb="tab-border"]{ display:none; }
+div[role="dialog"] .stat{ padding:8px 10px; }
+div[role="dialog"] .stat-v{ font-size:0.95rem; }
+div[role="dialog"] .lvl{ padding:5px 10px; font-size:0.8rem; margin-bottom:3px; }
+div[role="dialog"] .sec-label{ margin:0 0 4px; }
 
 /* --- custom results table (matches the prototype) --- */
 .sh-tablewrap{ border:1px solid #E5ECF1; border-radius:12px; overflow-x:auto; margin-top:6px; }
@@ -905,7 +920,6 @@ def render_detail(symbol: str):
     st.markdown(
         f'<span style="color:{sector_color(d["sector"])};font-weight:600">'
         f'{d["sector"]}</span> · {d["name"]}', unsafe_allow_html=True)
-    st.write("")
 
     price = f"Rs {d['price']:,.2f}" if d["price"] else "n/a"
     mcap = f"Rs {d['mcap']/1e7:,.0f} Cr" if d["mcap"] else "n/a"
@@ -931,7 +945,6 @@ def render_detail(symbol: str):
     st.caption(f"Live price as of {dt.datetime.now().strftime('%d-%m-%Y, %H:%M')} "
                "(server time).")
 
-    st.write("")
     tab_levels, tab_health = st.tabs(["Price levels", "Financial health"])
 
     with tab_levels:
@@ -1036,24 +1049,27 @@ st.markdown(
     f'<div class="band-date">{dt.date.today().strftime("%d-%m-%Y")}</div></div>',
     unsafe_allow_html=True)
 
-# --- sidebar: search ---
-with st.sidebar:
-    all_syms = load_all_nse_tickers()
-    if all_syms:
-        opts = [s.replace(".NS", "") for s in all_syms]
-        picked_search = st.selectbox(" ", opts, index=None, placeholder="Search Stock",
-                                     label_visibility="collapsed")
-        if picked_search and st.button("Open detail", use_container_width=True,
-                                       type="primary"):
-            detail_dialog(picked_search)
+# --- global stock search (moved out of the sidebar, sits under the header) ---
+_sp, _sbox = st.columns([2, 1], gap="large")
+with _sbox:
+    _all_syms = load_all_nse_tickers()
+    if _all_syms:
+        _opts = [s.replace(".NS", "") for s in _all_syms]
+        _picked = st.selectbox(" ", _opts, index=None,
+                               placeholder="🔍  Search any stock…",
+                               label_visibility="collapsed")
+        if _picked and st.session_state.get("last_search") != _picked:
+            st.session_state["last_search"] = _picked
+            detail_dialog(_picked)
     else:
-        typed = st.text_input(" ", placeholder="Search Stock", label_visibility="collapsed")
-        if st.button("Open detail", use_container_width=True, type="primary") \
-                and typed.strip():
-            detail_dialog(typed.strip().upper())
+        _typed = st.text_input(" ", placeholder="🔍  Search any stock…",
+                               label_visibility="collapsed")
+        if _typed.strip() and st.session_state.get("last_search") != _typed.strip().upper():
+            st.session_state["last_search"] = _typed.strip().upper()
+            detail_dialog(_typed.strip().upper())
 
+# --- sidebar: live controls ---
 with st.sidebar:
-    st.markdown("---")
     st.toggle("Live updates", value=True, key="live_on")
     if st.session_state.get("live_on"):
         st.select_slider("Refresh every (sec)", options=[1, 5, 10, 15, 30, 60],
@@ -1063,8 +1079,14 @@ live_every = st.session_state.get("live_every", 1)
 
 # --- top nav: Screener / News / Stock OI ---
 st.session_state.setdefault("view", "Screener")
-view = st.radio("view", ["Screener", "News", "Stock OI"],
+view = st.radio("view", ["Screener", "Stock OI", "News"],
                 horizontal=True, label_visibility="collapsed", key="view")
+
+# --- hyperlink handler: ?stock=SYMBOL opens the detail dialog in any view ---
+qp_stock = st.query_params.get("stock")
+if qp_stock and st.session_state.get("qp_opened") != qp_stock:
+    st.session_state["qp_opened"] = qp_stock
+    detail_dialog(str(qp_stock).upper())
 
 if view == "News":
     st.markdown("### Financial news")
@@ -1098,7 +1120,7 @@ if view == "Stock OI":
         _ocl = "#0B7A4B" if _oc >= 0 else "#B3261E"
         _oi_rows.append(
             "<tr>"
-            f'<td><a class="c-sym">{_r["sym"]}</a></td>'
+            f'<td><a class="c-sym" href="?stock={_r["sym"]}" target="_self">{_r["sym"]}</a></td>'
             f'<td class="c-num">{_r["ltp"]:,.2f}</td>'
             f'<td class="c-num" style="color:{_pcl};font-weight:600">{_pc:+.2f}%</td>'
             f'<td class="c-num c-muted">{int(_r["oi"]):,}</td>'
@@ -1137,37 +1159,28 @@ def render_indices_strip():
 
 render_indices_strip()
 
-# --- hyperlink handler: ?stock=SYMBOL opens the dialog ---
-qp_stock = st.query_params.get("stock")
-if qp_stock and st.session_state.get("qp_opened") != qp_stock:
-    st.session_state["qp_opened"] = qp_stock
-    detail_dialog(str(qp_stock).upper())
-
-# --- universe as buttons ---
+# --- universe + actions on one line ---
 st.markdown('<div class="sec-label">Stocks to scan</div>', unsafe_allow_html=True)
 if "universe" not in st.session_state:
     st.session_state["universe"] = "NIFTY 50"
-ucols = st.columns(len(UNIVERSES))
-for col, name in zip(ucols, UNIVERSES):
+st.session_state.setdefault("rsi_thr", 65)
+row = st.columns([2, 2, 2, 1, 1], gap="small")
+for col, name in zip(row[:3], UNIVERSES):
     if col.button(name, use_container_width=True,
                   type="primary" if st.session_state["universe"] == name else "secondary",
                   key=f"u_{name}"):
         st.session_state["universe"] = name
         st.rerun()
 universe_choice = st.session_state["universe"]
-
 uploaded = None
+run = row[3].button("Run", type="primary", use_container_width=True)
+clear = row[4].button("Clear", use_container_width=True)
 
-st.session_state.setdefault("rsi_thr", 65)
-st.markdown('<div class="sec-label" style="margin-top:16px">Screen filters</div>',
+st.markdown('<div class="sec-label" style="margin-top:12px">Filters</div>',
             unsafe_allow_html=True)
-fc1, fc2 = st.columns([3, 2], gap="large")
-threshold = fc1.slider("RSI at or above", 0, 90, key="rsi_thr")
-fetch_limit = fc2.number_input("Load details for top N matches", 10, 500, 100, 10)
-
-bc1, bc2, _bc3 = st.columns([1, 1, 4], gap="small")
-run = bc1.button("Run screen", type="primary", use_container_width=True)
-clear = bc2.button("Clear", use_container_width=True)
+fcol, _fsp = st.columns([3, 2], gap="large")
+threshold = fcol.slider(f"RSI at or above — {st.session_state['rsi_thr']}", 0, 90,
+                        key="rsi_thr")
 
 if universe_choice == "All NIFTY Stocks":
     st.caption("All NIFTY Stocks pulls ~2000 listed stocks and can take several "
@@ -1185,11 +1198,11 @@ if run:
     if not tickers:
         st.error(f"The {universe_choice} list did not load. Try again in a minute.")
         st.stop()
-    st.session_state["results"] = scan(tuple(tickers), float(threshold), int(fetch_limit))
+    st.session_state["results"] = scan(tuple(tickers), float(threshold), FUND_LIMIT)
     st.session_state["scanned"] = len(tickers)
     st.session_state["threshold"] = threshold
     st.session_state["opened_for"] = None
-    st.query_params["scan"] = _cfg_str(universe_choice, threshold, int(fetch_limit))
+    st.query_params["scan"] = _cfg_str(universe_choice, threshold, FUND_LIMIT)
     if "stock" in st.query_params:
         del st.query_params["stock"]
     st.session_state.pop("qp_opened", None)
@@ -1219,11 +1232,11 @@ elif results.empty:
     st.warning(f"Nothing is at RSI {st.session_state.get('threshold', threshold)} or "
                "above right now. Lower the threshold or widen the stock list.")
 else:
-    hleft, hright = st.columns([3, 1])
+    hleft, hright = st.columns([4, 1], gap="small")
     hleft.markdown(f"**{len(results)} stocks** at RSI "
                    f"{st.session_state.get('threshold', threshold)} or above, "
                    f"from {st.session_state.get('scanned', 0)} scanned.")
-    hright.download_button("Download report", data=to_excel_bytes(results),
+    hright.download_button("⤓  Download report", data=to_excel_bytes(results),
                            file_name=f"RSI_Screener_{dt.date.today().isoformat()}.xlsx",
                            mime="application/vnd.openxmlformats-officedocument."
                                 "spreadsheetml.sheet", use_container_width=True)
