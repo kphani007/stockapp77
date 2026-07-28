@@ -45,14 +45,15 @@ NIFTY50 = [
 
 HEADERS = [
     "Date", "Stock Symbol", "Sector", "Current Price (Rs)", "Volume",
-    "RSI", "Buy/Sell", "52 Week High (Rs)", "1 Year Target (Rs)",
+    "RSI", "PE", "Sec PE", "Buy/Sell", "52 Week High (Rs)", "1 Year Target (Rs)",
 ]
 
 COL_LABELS = {
     "Date": "Date", "Stock Symbol": "Stock Symbol", "Sector": "Sector",
     "Current Price (Rs)": "Current Price", "Volume": "Volume", "RSI": "RSI",
+    "PE": "PE", "Sec PE": "Sec PE",
     "Buy/Sell": "Buy / Sell", "52 Week High (Rs)": "52-Week High",
-    "1 Year Target (Rs)": "1-Year Target",
+    "1 Year Target (Rs)": "1-Year Forecast",
 }
 
 SAMPLE_OI = [
@@ -259,7 +260,9 @@ h1,h2,h3,h4,h5 { font-family:'Archivo', sans-serif; letter-spacing:-0.02em; }
 .stat-row{ display:flex; flex-wrap:wrap; gap:10px; margin-bottom:4px; }
 .stat{ flex:1 1 150px; border-radius:12px; padding:11px 13px; border:1px solid var(--line);
   border-top:4px solid var(--teal); background:#FFF; }
-div[role="dialog"]{ max-width:760px !important; }
+div[role="dialog"]{ max-width:600px !important; }
+.stat-row .stat{ flex:1 1 120px; padding:9px 11px; }
+.stat-row .stat-v{ font-size:1.0rem; }
 .stat.v{ border-top-color:var(--violet); }
 .stat.a{ border-top-color:var(--amber); }
 .stat.b{ border-top-color:var(--blue); }
@@ -575,6 +578,30 @@ def load_nifty500_tickers() -> list[str]:
     return _fetch_symbol_csv(_INDEX500_LIST_URL)
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_face_values() -> dict:
+    """Map SYMBOL -> face value from NSE's public EQUITY_L.csv (no auth needed)."""
+    hdr = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Accept": "text/csv,*/*"}
+    try:
+        r = requests.get(_EQUITY_LIST_URL, headers=hdr, timeout=20)
+        r.raise_for_status()
+        df = pd.read_csv(io.StringIO(r.text))
+        df.columns = [c.strip().upper() for c in df.columns]
+        sym_c = next((c for c in df.columns if c == "SYMBOL"), None)
+        fv_c = next((c for c in df.columns if c == "FACE VALUE"), None)
+        if not sym_c or not fv_c:
+            return {}
+        out = {}
+        for _, row in df[[sym_c, fv_c]].dropna().iterrows():
+            try:
+                out[str(row[sym_c]).strip().upper()] = float(row[fv_c])
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return {}
+
+
 def parse_uploaded_symbols(text: str) -> list[str]:
     out = []
     for line in text.replace(",", "\n").splitlines():
@@ -606,7 +633,7 @@ def _cfg_str(u: str, th, n) -> str:
 
 def fetch_fundamentals(symbol: str) -> dict:
     name = symbol.replace(".NS", "")
-    sector, reco, target = "n/a", "n/a", "n/a"
+    sector, reco, target, pe = "n/a", "n/a", "n/a", None
     tk = yf.Ticker(symbol)
     try:
         info = tk.info or {}
@@ -619,6 +646,9 @@ def fetch_fundamentals(symbol: str) -> dict:
         tp = info.get("targetMeanPrice")
         if tp:
             target = round(float(tp), 2)
+        pev = info.get("trailingPE")
+        if pev:
+            pe = round(float(pev), 2)
     except Exception:
         pass
     if target == "n/a":
@@ -628,7 +658,7 @@ def fetch_fundamentals(symbol: str) -> dict:
                 target = round(float(m), 2)
         except Exception:
             pass
-    return {"name": name, "sector": sector, "reco": reco, "target": target}
+    return {"name": name, "sector": sector, "reco": reco, "target": target, "pe": pe}
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -636,7 +666,7 @@ def fetch_detail(symbol: str) -> dict:
     out = {"name": symbol.replace(".NS", ""), "sector": "n/a", "mcap": None,
            "price": None, "high52": None, "low52": None, "rsi": None,
            "reco": "n/a", "target": "n/a", "levels": {}, "swing": (None, None),
-           "checks": [], "error": None}
+           "checks": [], "face": None, "book": None, "beta": None, "error": None}
     try:
         tk = yf.Ticker(symbol)
         hist = tk.history(period="2y", interval="1d", auto_adjust=False)
@@ -668,6 +698,11 @@ def fetch_detail(symbol: str) -> dict:
             tp = info.get("targetMeanPrice")
             if tp:
                 out["target"] = round(float(tp), 2)
+            out["book"] = info.get("bookValue")
+            out["beta"] = info.get("beta")
+            out["face"] = info.get("faceValue") or info.get("parValue")
+            if out["face"] is None:
+                out["face"] = load_face_values().get(symbol.replace(".NS", "").upper())
         except Exception:
             pass
         try:
@@ -774,22 +809,32 @@ def scan(tickers: tuple[str, ...], threshold: float, fetch_fund_limit: int) -> p
             bar.progress((idx + 1) / max(total, 1), text=f"Loaded {idx+1}/{total}")
         else:
             f = {"name": sym.replace(".NS", ""), "sector": "not loaded",
-                 "reco": "not loaded", "target": "not loaded"}
+                 "reco": "not loaded", "target": "not loaded", "pe": None}
         cser = close_map.get(sym)
         rows.append({
-            "Date": dt.date.today().isoformat(),
+            "Date": dt.date.today().strftime("%d-%m-%Y"),
             "Stock Symbol": sym.replace(".NS", ""),
             "Sector": f["sector"],
             "Current Price (Rs)": round(price, 2),
             "Volume": vol_map.get(sym),
             "52 Week High (Rs)": round(high52, 2) if high52 else None,
             "RSI": round(rsi, 1),
+            "PE": f.get("pe"),
+            "Sec PE": None,
             "Buy/Sell": f["reco"],
             "1 Year Target (Rs)": f["target"],
             "_SMA20": _sma(cser, 20),
             "_SMA50": _sma(cser, 50),
             "_SMA200": _sma(cser, 200),
         })
+    # Sector P/E = mean trailing P/E of scanned stocks in the same sector
+    sec_pes: dict[str, list[float]] = {}
+    for r in rows:
+        if isinstance(r["PE"], (int, float)) and isinstance(r["Sector"], str):
+            sec_pes.setdefault(r["Sector"], []).append(float(r["PE"]))
+    sec_avg = {k: round(sum(v) / len(v), 2) for k, v in sec_pes.items()}
+    for r in rows:
+        r["Sec PE"] = sec_avg.get(r["Sector"])
     bar.empty()
     return pd.DataFrame(rows, columns=HEADERS + ["_SMA20", "_SMA50", "_SMA200"])
 
@@ -810,27 +855,30 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
         cell.fill, cell.font = hfill, hfont
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
+    col_of = {h: i + 1 for i, h in enumerate(HEADERS)}
     for _, r in df.iterrows():
         ws.append([r[h] for h in HEADERS])
         i = ws.max_row
         for cell in ws[i]:
             cell.font = bfont
-        for col in (4, 8, 9):
-            c = ws.cell(row=i, column=col)
+        for hh in ("Current Price (Rs)", "52 Week High (Rs)", "1 Year Target (Rs)",
+                   "PE", "Sec PE"):
+            c = ws.cell(row=i, column=col_of[hh])
             if isinstance(c.value, (int, float)):
                 c.number_format = "#,##0.00"
-        vcell = ws.cell(row=i, column=5)
+        vcell = ws.cell(row=i, column=col_of["Volume"])
         if isinstance(vcell.value, (int, float)):
             vcell.number_format = "#,##0"
-        ws.cell(row=i, column=6).number_format = "0.0"
+        ws.cell(row=i, column=col_of["RSI"]).number_format = "0.0"
         if isinstance(r["RSI"], (int, float)) and r["RSI"] >= 70:
             for cell in ws[i]:
                 cell.fill = hot
 
-    for i, w in enumerate([12, 16, 22, 16, 14, 8, 14, 16, 16], start=1):
+    for i, w in enumerate([12, 16, 22, 16, 14, 8, 8, 10, 14, 16, 16], start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:I{max(ws.max_row, 2)}"
+    last_col = get_column_letter(len(HEADERS))
+    ws.auto_filter.ref = f"A1:{last_col}{max(ws.max_row, 2)}"
     ws.cell(row=ws.max_row + 2, column=1, value="Disclaimer: " + DISCLAIMER).font = \
         Font(name="Arial", italic=True, size=9)
 
@@ -864,6 +912,9 @@ def render_detail(symbol: str):
     rsi = f"{d['rsi']:.1f}" if d["rsi"] else "n/a"
     rng = f"{d['low52']:,.0f} – {d['high52']:,.0f}" if d["high52"] else "n/a"
     tgt = f"Rs {d['target']:,.2f}" if isinstance(d["target"], (int, float)) else "n/a"
+    face = f"Rs {d['face']:,.2f}" if isinstance(d["face"], (int, float)) else "n/a"
+    book = f"Rs {d['book']:,.2f}" if isinstance(d["book"], (int, float)) else "n/a"
+    beta = f"{d['beta']:.2f}" if isinstance(d["beta"], (int, float)) else "n/a"
 
     cards = "".join([
         _stat("Price", price, "", ""),
@@ -871,10 +922,13 @@ def render_detail(symbol: str):
         _stat("RSI (14d)", rsi,
               "overbought zone" if d["rsi"] and d["rsi"] >= 70 else "momentum", "a"),
         _stat("52-week range", rng, "", "b"),
-        _stat("1-year target", tgt, f"consensus: {d['reco']}", "g"),
+        _stat("1-year forecast", tgt, f"consensus: {d['reco']}", "g"),
+        _stat("Face value", face, "", "v"),
+        _stat("Book value", book, "per share", "b"),
+        _stat("Beta", beta, "volatility vs market", "a"),
     ])
     st.markdown(f'<div class="stat-row">{cards}</div>', unsafe_allow_html=True)
-    st.caption(f"Live price as of {dt.datetime.now().strftime('%d %b %Y, %H:%M')} "
+    st.caption(f"Live price as of {dt.datetime.now().strftime('%d-%m-%Y, %H:%M')} "
                "(server time).")
 
     st.write("")
@@ -955,7 +1009,7 @@ def render_detail(symbol: str):
                        "related-party transactions, contingent liabilities.")
 
 
-@st.dialog("Stock detail", width="large")
+@st.dialog("Stock detail", width="small")
 def detail_dialog(symbol: str):
     render_detail(symbol)
 
@@ -975,9 +1029,9 @@ st.markdown(
     'stroke-linecap="round" stroke-linejoin="round"/>'
     '<path d="M20 8 H28 V16" stroke="url(#smg)" stroke-width="3.4" '
     'stroke-linecap="round" stroke-linejoin="round"/></svg></span>'
-    'Stock<span class="m">Merit</span></div>'
-    '<div class="band-sub">Analyze at one place…</div></div>'
-    f'<div class="band-date">{dt.date.today().strftime("%d %b %Y")}</div></div>',
+    'Stock<span class="m" style="color:#fff">Merit</span></div>'
+    '<div class="band-sub">Analyze at one place …</div></div>'
+    f'<div class="band-date">{dt.date.today().strftime("%d-%m-%Y")}</div></div>',
     unsafe_allow_html=True)
 
 # --- sidebar: search ---
@@ -1000,10 +1054,10 @@ with st.sidebar:
     st.markdown("---")
     st.toggle("Live updates", value=True, key="live_on")
     if st.session_state.get("live_on"):
-        st.select_slider("Refresh every (sec)", options=[5, 10, 15, 30, 60],
-                         value=15, key="live_every")
+        st.select_slider("Refresh every (sec)", options=[1, 5, 10, 15, 30, 60],
+                         value=1, key="live_every")
 live_on = st.session_state.get("live_on", True)
-live_every = st.session_state.get("live_every", 15)
+live_every = st.session_state.get("live_every", 1)
 
 # --- top nav: Screener / News / Stock OI ---
 st.session_state.setdefault("view", "Screener")
@@ -1174,7 +1228,7 @@ else:
     def _fmt(x):
         return f"{x:,.2f}" if isinstance(x, (int, float)) else str(x)
 
-    aligns = ["l", "l", "l", "r", "r", "r", "c", "r", "r"]
+    aligns = ["l", "l", "l", "r", "r", "r", "r", "r", "c", "r", "r"]
     head_html = "".join(
         f'<th class="th-{a}">{COL_LABELS.get(h, h)}</th>' for h, a in zip(HEADERS, aligns))
 
@@ -1191,6 +1245,8 @@ else:
         sma_tip = (f"20-day SMA: {_sv(r.get('_SMA20'))}  |  "
                    f"50-day SMA: {_sv(r.get('_SMA50'))}  |  "
                    f"200-day SMA: {_sv(r.get('_SMA200'))}")
+        _pe = _sv(r.get("PE"))
+        _secpe = _sv(r.get("Sec PE"))
         body_rows.append(
             "<tr>"
             f'<td class="c-date">{r["Date"]}</td>'
@@ -1199,6 +1255,8 @@ else:
             f'<td class="c-num c-price" title="{sma_tip}">{_fmt(r["Current Price (Rs)"])}</td>'
             f'<td class="c-num c-muted">{_vol(r.get("Volume"))}</td>'
             f'<td class="c-num c-rsi" style="color:{rsi_color(rsi)}">{rsi_txt}</td>'
+            f'<td class="c-num">{_pe}</td>'
+            f'<td class="c-num c-muted">{_secpe}</td>'
             f'<td class="c-reco"><span class="pill" title="{reco_info(reco)}" '
             f'style="background:{reco_color(reco)}">{reco}</span></td>'
             f'<td class="c-num c-muted">{_fmt(r["52 Week High (Rs)"])}</td>'
