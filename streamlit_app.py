@@ -12,7 +12,11 @@ Deploy free on Streamlit Community Cloud (share.streamlit.io). Locally:
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import hmac
+import html as _html
 import io
+import re
 import time
 from collections import Counter
 from urllib.parse import quote
@@ -237,21 +241,22 @@ h1,h2,h3,h4,h5 { font-family:'Archivo', sans-serif; letter-spacing:-0.02em; }
 [data-testid="stDataFrame"] { font-family:'IBM Plex Mono', monospace; }
 
 .band{
+  position:sticky; top:0; z-index:1000;
   background:linear-gradient(100deg,#111C2B 0%,#123A44 55%,#0E7C86 100%);
-  border-radius:14px; padding:14px 22px; margin-bottom:12px;
+  border-radius:12px; padding:8px 18px; margin-bottom:12px;
   display:flex; align-items:center; justify-content:space-between;
-  flex-wrap:wrap; gap:10px;
+  flex-wrap:wrap; gap:10px; box-shadow:0 10px 28px -16px rgba(17,28,43,0.6);
 }
-.band-name{ font-family:'Archivo',sans-serif; font-weight:700; font-size:1.3rem;
+.band-name{ font-family:'Archivo',sans-serif; font-weight:700; font-size:1.15rem;
   color:#FFF; letter-spacing:-0.03em; line-height:1.1; display:flex; align-items:center; gap:8px; }
-.band-name .brandmark{ width:26px; height:26px; border-radius:7px; background:#FFF;
+.band-name .brandmark{ width:22px; height:22px; border-radius:6px; background:#FFF;
   display:inline-flex; align-items:center; justify-content:center; }
 .band-name .m{ color:#5CA8FF; }
 .band-sub{ font-family:'IBM Plex Mono',monospace; font-size:0.78rem;
   color:#B6D8DC; margin-top:6px; }
-.idxcard{ background:#FFF; border:1px solid #DDE6ED; border-radius:12px; padding:11px 14px; }
+.idxcard{ background:#FFF; border:1px solid #DDE6ED; border-radius:10px; padding:8px 11px; }
 .idx-n{ font-size:0.66rem; text-transform:uppercase; letter-spacing:0.06em; color:#5E6E7E; font-weight:600; }
-.idx-v{ font-family:'IBM Plex Mono',monospace; font-size:1.0rem; font-weight:600; margin-top:4px; }
+.idx-v{ font-family:'IBM Plex Mono',monospace; font-size:0.9rem; font-weight:600; margin-top:3px; }
 .idx-c{ font-family:'IBM Plex Mono',monospace; font-size:0.74rem; font-weight:600; margin-top:2px; }
 .band-date{ font-family:'IBM Plex Mono',monospace; font-size:0.78rem; color:#EAF6F7;
   background:rgba(255,255,255,0.14); border-radius:999px; padding:6px 14px; }
@@ -315,8 +320,8 @@ div[role="dialog"]{ max-width:600px !important; }
   border:1px solid var(--teal); font-weight:600; border-radius:9px; padding:5px 14px; }
 .stDownloadButton>button:hover{ background:#E3F2F3; color:var(--teal); }
 div[role="dialog"] button[data-baseweb="tab"]{ font-family:'Archivo',sans-serif;
-  font-weight:700; font-size:0.9rem; background:#EEF3F6; border-radius:8px 8px 0 0;
-  padding:6px 18px; margin-right:6px; color:var(--muted); }
+  font-weight:800; font-size:0.98rem; background:#EAF2FB; border-radius:8px 8px 0 0;
+  padding:7px 20px; margin-right:6px; color:#1F6FB2; }
 div[role="dialog"] button[data-baseweb="tab"][aria-selected="true"]{
   background:var(--teal); color:#FFF; }
 div[role="dialog"] div[data-baseweb="tab-highlight"]{ display:none; }
@@ -925,10 +930,11 @@ def render_detail(symbol: str):
         st.warning(d["error"])
         return
 
-    st.markdown(f"### {symbol}")
+    st.markdown(f"### {_html.escape(str(symbol))}")
     st.markdown(
         f'<span style="color:{sector_color(d["sector"])};font-weight:600">'
-        f'{d["sector"]}</span> · {d["name"]}', unsafe_allow_html=True)
+        f'{_html.escape(str(d["sector"]))}</span> · {_html.escape(str(d["name"]))}',
+        unsafe_allow_html=True)
 
     price = f"Rs {d['price']:,.2f}" if d["price"] else "n/a"
     mcap = f"Rs {d['mcap']/1e7:,.0f} Cr" if d["mcap"] else "n/a"
@@ -1073,6 +1079,62 @@ st.set_page_config(page_title="StockMerit — NSE RSI Screener",
                    page_icon="📊", layout="wide")
 st.markdown(CSS, unsafe_allow_html=True)
 
+# ------------------------------ auth gate ---------------------------------
+SESSION_TTL = 30 * 60  # sign a session out after 30 min idle
+
+
+def _valid_symbol(sym: str) -> bool:
+    """Whitelist symbol input to block injection via search box / URL params."""
+    return bool(re.fullmatch(r"[A-Za-z0-9&.\-]{1,20}", sym or ""))
+
+
+def require_login() -> None:
+    now = time.time()
+    if st.session_state.get("authed"):
+        if now - st.session_state.get("auth_time", now) > SESSION_TTL:
+            for _k in ("authed", "auth_time"):
+                st.session_state.pop(_k, None)
+        else:
+            st.session_state["auth_time"] = now
+            return
+    exp_user = str(st.secrets.get("APP_USERNAME", "")).strip()
+    exp_hash = str(st.secrets.get("APP_PASSWORD_SHA256", "")).strip().lower()
+    st.markdown(
+        '<div class="band" style="justify-content:flex-start"><div class="band-name">'
+        '<span class="brandmark"><svg width="16" height="16" viewBox="0 0 32 32" fill="none">'
+        '<defs><linearGradient id="lsm" x1="2" y1="26" x2="30" y2="6" gradientUnits="userSpaceOnUse">'
+        '<stop stop-color="#1B4DB8"/><stop offset="1" stop-color="#3E9BFF"/></linearGradient></defs>'
+        '<path d="M4 22 L13 15 L18 19 L27 8" stroke="url(#lsm)" stroke-width="3.4" '
+        'stroke-linecap="round" stroke-linejoin="round"/>'
+        '<path d="M20 8 H28 V16" stroke="url(#lsm)" stroke-width="3.4" '
+        'stroke-linecap="round" stroke-linejoin="round"/></svg></span>'
+        '<span><span style="color:#FFFFFF">Stock</span><span style="color:#5CA8FF">Mer</span>'
+        '<span style="color:#FFFFFF">it</span></span></div></div>', unsafe_allow_html=True)
+    _mid = st.columns([1, 1.4, 1])[1]
+    with _mid:
+        st.markdown("#### Sign in to continue")
+        with st.form("login_form", clear_on_submit=False):
+            _u = st.text_input("Username")
+            _p = st.text_input("Password", type="password")
+            _ok = st.form_submit_button("Sign in", use_container_width=True, type="primary")
+        if _ok:
+            if not exp_user or not exp_hash:
+                st.error("Login is not configured. Add APP_USERNAME and "
+                         "APP_PASSWORD_SHA256 to the app secrets, then reload.")
+            elif (hmac.compare_digest(_u.strip(), exp_user) and hmac.compare_digest(
+                    hashlib.sha256(_p.encode()).hexdigest(), exp_hash)):
+                st.session_state["authed"] = True
+                st.session_state["auth_time"] = now
+                st.rerun()
+            else:
+                st.error("Incorrect username or password.")
+        st.caption("Authorized access only. Sessions end after 30 minutes idle "
+                   "or when the app is relaunched.")
+    st.stop()
+
+
+require_login()
+
 st.markdown(
     '<div class="band"><div><div class="band-name">'
     '<span class="brandmark"><svg width="22" height="22" viewBox="0 0 32 32" fill="none">'
@@ -1082,15 +1144,20 @@ st.markdown(
     'stroke-linecap="round" stroke-linejoin="round"/>'
     '<path d="M20 8 H28 V16" stroke="url(#smg)" stroke-width="3.4" '
     'stroke-linecap="round" stroke-linejoin="round"/></svg></span>'
-    '<span style="letter-spacing:-0.02em"><span style="color:#5CA8FF">Stock</span>'
-    '<span style="color:#FFFFFF">Mer</span>'
-    '<span style="color:#5CA8FF">it</span></span></div>'
+    '<span style="letter-spacing:-0.02em"><span style="color:#FFFFFF">Stock</span>'
+    '<span style="color:#5CA8FF">Mer</span>'
+    '<span style="color:#FFFFFF">it</span></span></div>'
     '<div class="band-sub">Analyze at one place …</div></div>'
     f'<div class="band-date">{dt.date.today().strftime("%d-%m-%Y")}</div></div>',
     unsafe_allow_html=True)
 
 # --- global stock search (moved out of the sidebar, sits under the header) ---
 _sp, _sbox = st.columns([2, 1], gap="large")
+with _sp:
+    if st.button("Sign out"):
+        for _k in ("authed", "auth_time"):
+            st.session_state.pop(_k, None)
+        st.rerun()
 with _sbox:
     _all_syms = load_all_nse_tickers()
     if _all_syms:
@@ -1104,9 +1171,10 @@ with _sbox:
     else:
         _typed = st.text_input(" ", placeholder="🔍  Search any stock…",
                                label_visibility="collapsed")
-        if _typed.strip() and st.session_state.get("last_search") != _typed.strip().upper():
-            st.session_state["last_search"] = _typed.strip().upper()
-            detail_dialog(_typed.strip().upper())
+        _tv = _typed.strip().upper()
+        if _tv and _valid_symbol(_tv) and st.session_state.get("last_search") != _tv:
+            st.session_state["last_search"] = _tv
+            detail_dialog(_tv)
 
 # --- live-tick settings (kept in code; no sidebar UI) ---
 live_on = True
@@ -1123,7 +1191,7 @@ view = st.radio("view", ["Screener", "Stock OI", "News"],
 
 # --- hyperlink handler: ?stock=SYMBOL opens the detail dialog in any view ---
 qp_stock = st.query_params.get("stock")
-if qp_stock and st.session_state.get("qp_opened") != qp_stock:
+if qp_stock and _valid_symbol(str(qp_stock)) and st.session_state.get("qp_opened") != qp_stock:
     st.session_state["qp_opened"] = qp_stock
     detail_dialog(str(qp_stock).upper())
 
@@ -1306,7 +1374,7 @@ else:
             "<tr>"
             f'<td class="c-date">{r["Date"]}</td>'
             f'<td><a class="c-sym" href="{href}" target="_self">{sym}</a></td>'
-            f'<td class="c-sec" style="color:{sector_color(r["Sector"])}">{r["Sector"]}</td>'
+            f'<td class="c-sec" style="color:{sector_color(r["Sector"])}">{_html.escape(str(r["Sector"]))}</td>'
             f'<td class="c-num c-price" title="{sma_tip}">{_fmt(r["Current Price (Rs)"])}</td>'
             f'<td class="c-num c-muted">{_vol(r.get("Volume"))}</td>'
             f'<td class="c-num c-rsi" style="color:{rsi_color(rsi)}">{rsi_txt}</td>'
