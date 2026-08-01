@@ -4,3 +4,16 @@ backgroundColor = "#FFFFFF"
 secondaryBackgroundColor = "#EEF3F6"
 textColor = "#16202B"
 font = "sans serif"
+
+# --- security hardening (OWASP) ---
+[server]
+enableXsrfProtection = true   # block cross-site request forgery
+enableCORS = false            # reject cross-origin browser requests
+maxUploadSize = 5             # cap upload size (MB)
+
+[client]
+showErrorDetails = false      # never leak stack traces / internals to users
+toolbarMode = "minimal"
+
+[browser]
+gatherUsageStats = false      # no telemetry
