@@ -12,8 +12,6 @@ Deploy free on Streamlit Community Cloud (share.streamlit.io). Locally:
 from __future__ import annotations
 
 import datetime as dt
-import hashlib
-import hmac
 import html as _html
 import io
 import re
@@ -1079,61 +1077,11 @@ st.set_page_config(page_title="StockMerit — NSE RSI Screener",
                    page_icon="📊", layout="wide")
 st.markdown(CSS, unsafe_allow_html=True)
 
-# ------------------------------ auth gate ---------------------------------
-SESSION_TTL = 30 * 60  # sign a session out after 30 min idle
-
 
 def _valid_symbol(sym: str) -> bool:
     """Whitelist symbol input to block injection via search box / URL params."""
     return bool(re.fullmatch(r"[A-Za-z0-9&.\-]{1,20}", sym or ""))
 
-
-def require_login() -> None:
-    now = time.time()
-    if st.session_state.get("authed"):
-        if now - st.session_state.get("auth_time", now) > SESSION_TTL:
-            for _k in ("authed", "auth_time"):
-                st.session_state.pop(_k, None)
-        else:
-            st.session_state["auth_time"] = now
-            return
-    exp_user = str(st.secrets.get("APP_USERNAME", "")).strip()
-    exp_hash = str(st.secrets.get("APP_PASSWORD_SHA256", "")).strip().lower()
-    st.markdown(
-        '<div class="band" style="justify-content:flex-start"><div class="band-name">'
-        '<span class="brandmark"><svg width="16" height="16" viewBox="0 0 32 32" fill="none">'
-        '<defs><linearGradient id="lsm" x1="2" y1="26" x2="30" y2="6" gradientUnits="userSpaceOnUse">'
-        '<stop stop-color="#1B4DB8"/><stop offset="1" stop-color="#3E9BFF"/></linearGradient></defs>'
-        '<path d="M4 22 L13 15 L18 19 L27 8" stroke="url(#lsm)" stroke-width="3.4" '
-        'stroke-linecap="round" stroke-linejoin="round"/>'
-        '<path d="M20 8 H28 V16" stroke="url(#lsm)" stroke-width="3.4" '
-        'stroke-linecap="round" stroke-linejoin="round"/></svg></span>'
-        '<span><span style="color:#FFFFFF">Stock</span><span style="color:#5CA8FF">Mer</span>'
-        '<span style="color:#FFFFFF">it</span></span></div></div>', unsafe_allow_html=True)
-    _mid = st.columns([1, 1.4, 1])[1]
-    with _mid:
-        st.markdown("#### Sign in to continue")
-        with st.form("login_form", clear_on_submit=False):
-            _u = st.text_input("Username")
-            _p = st.text_input("Password", type="password")
-            _ok = st.form_submit_button("Sign in", use_container_width=True, type="primary")
-        if _ok:
-            if not exp_user or not exp_hash:
-                st.error("Login is not configured. Add APP_USERNAME and "
-                         "APP_PASSWORD_SHA256 to the app secrets, then reload.")
-            elif (hmac.compare_digest(_u.strip(), exp_user) and hmac.compare_digest(
-                    hashlib.sha256(_p.encode()).hexdigest(), exp_hash)):
-                st.session_state["authed"] = True
-                st.session_state["auth_time"] = now
-                st.rerun()
-            else:
-                st.error("Incorrect username or password.")
-        st.caption("Authorized access only. Sessions end after 30 minutes idle "
-                   "or when the app is relaunched.")
-    st.stop()
-
-
-require_login()
 
 st.markdown(
     '<div class="band"><div><div class="band-name">'
@@ -1153,11 +1101,6 @@ st.markdown(
 
 # --- global stock search (moved out of the sidebar, sits under the header) ---
 _sp, _sbox = st.columns([2, 1], gap="large")
-with _sp:
-    if st.button("Sign out"):
-        for _k in ("authed", "auth_time"):
-            st.session_state.pop(_k, None)
-        st.rerun()
 with _sbox:
     _all_syms = load_all_nse_tickers()
     if _all_syms:
