@@ -49,13 +49,13 @@ NIFTY50 = [
 
 HEADERS = [
     "Date", "Stock Symbol", "Sector", "Current Price (Rs)", "Volume",
-    "RSI", "PE", "Sec PE", "Buy/Sell", "52 Week High (Rs)", "1 Year Target (Rs)",
+    "RSI", "VWAP", "PE", "Sec PE", "Buy/Sell", "52 Week High (Rs)", "1 Year Target (Rs)",
 ]
 
 COL_LABELS = {
     "Date": "Date", "Stock Symbol": "Stock Symbol", "Sector": "Sector",
     "Current Price (Rs)": "Current Price", "Volume": "Volume", "RSI": "RSI",
-    "PE": "PE", "Sec PE": "Sec PE",
+    "VWAP": "VWAP", "PE": "PE", "Sec PE": "Sec PE",
     "Buy/Sell": "Buy/Sell", "52 Week High (Rs)": "52 Week High",
     "1 Year Target (Rs)": "1 Year Forecast",
 }
@@ -442,6 +442,20 @@ def sector_color(name) -> str:
     return SECTOR_PALETTE[sum(ord(c) for c in name) % len(SECTOR_PALETTE)]
 
 
+def compute_vwap(close: pd.Series, vol: pd.Series, n: int = 20):
+    """20-day volume-weighted average price. Returns None if unavailable."""
+    if close is None or vol is None:
+        return None
+    df = pd.concat([close, vol], axis=1).dropna()
+    if df.empty:
+        return None
+    df = df.tail(n)
+    tot_vol = float(df.iloc[:, 1].sum())
+    if not tot_vol:
+        return None
+    return float((df.iloc[:, 0] * df.iloc[:, 1]).sum() / tot_vol)
+
+
 def rsi_color(v) -> str:
     if not isinstance(v, (int, float)):
         return "#5E6E7E"
@@ -817,7 +831,7 @@ def fetch_indices(bucket: int = 0) -> list[dict]:
 @st.cache_data(ttl=300, show_spinner=False)
 def scan(tickers: tuple[str, ...], threshold: float, fetch_fund_limit: int) -> pd.DataFrame:
     bar = st.progress(0.0, text="Downloading price history...")
-    close_map, high_map, vol_map = {}, {}, {}
+    close_map, high_map, vol_map, volser_map = {}, {}, {}, {}
     batch, n = 200, len(tickers)
     for i in range(0, n, batch):
         chunk = list(tickers[i:i + batch])
@@ -833,6 +847,7 @@ def scan(tickers: tuple[str, ...], threshold: float, fetch_fund_limit: int) -> p
                 high_map[sym] = float(df["High"].dropna().max())
                 v = df["Volume"].dropna() if "Volume" in df else None
                 vol_map[sym] = float(v.iloc[-1]) if v is not None and not v.empty else None
+                volser_map[sym] = v
             except Exception:
                 continue
         bar.progress(min((i + batch) / n, 1.0), text=f"Downloaded {min(i+batch, n)}/{n} stocks")
@@ -860,6 +875,8 @@ def scan(tickers: tuple[str, ...], threshold: float, fetch_fund_limit: int) -> p
             f = {"name": sym.replace(".NS", ""), "sector": "not loaded",
                  "reco": "not loaded", "target": "not loaded", "pe": None}
         cser = close_map.get(sym)
+        _vw = compute_vwap(cser, volser_map.get(sym))
+        _vwap_pos = ("Above" if price > _vw else "Below") if _vw else "n/a"
         rows.append({
             "Date": dt.date.today().strftime("%d-%m-%Y"),
             "Stock Symbol": sym.replace(".NS", ""),
@@ -868,6 +885,7 @@ def scan(tickers: tuple[str, ...], threshold: float, fetch_fund_limit: int) -> p
             "Volume": vol_map.get(sym),
             "52 Week High (Rs)": round(high52, 2) if high52 else None,
             "RSI": round(rsi, 1),
+            "VWAP": _vwap_pos,
             "PE": f.get("pe"),
             "Sec PE": None,
             "Buy/Sell": f["reco"],
@@ -1324,7 +1342,7 @@ else:
     def _fmt(x):
         return f"{x:,.2f}" if isinstance(x, (int, float)) else str(x)
 
-    aligns = ["l", "l", "l", "r", "r", "r", "r", "r", "c", "r", "r"]
+    aligns = ["l", "l", "l", "r", "r", "r", "c", "r", "r", "c", "r", "r"]
     head_html = "".join(
         f'<th class="th-{a}">{COL_LABELS.get(h, h)}</th>' for h, a in zip(HEADERS, aligns))
 
@@ -1351,6 +1369,9 @@ else:
             f'<td class="c-num c-price" title="{sma_tip}">{_fmt(r["Current Price (Rs)"])}</td>'
             f'<td class="c-num c-muted">{_vol(r.get("Volume"))}</td>'
             f'<td class="c-num c-rsi" style="color:{rsi_color(rsi)}">{rsi_txt}</td>'
+            f'<td class="c-vwap" style="text-align:center;font-weight:600;'
+            f'color:{"#0B7A4B" if r["VWAP"]=="Above" else "#B3261E" if r["VWAP"]=="Below" else "#5E6E7E"}">'
+            f'{r["VWAP"]}</td>'
             f'<td class="c-num">{_pe}</td>'
             f'<td class="c-num c-muted">{_secpe}</td>'
             f'<td class="c-reco"><span class="pill" title="{reco_info(reco)}" '
