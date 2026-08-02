@@ -60,20 +60,10 @@ COL_LABELS = {
     "1 Year Target (Rs)": "1 Year Forecast",
 }
 
-SAMPLE_OI = [
-    ("RELIANCE", 2960, 1.8, 12450000, 6.2),
-    ("SBIN", 812, 2.1, 8990000, 9.5),
-    ("ICICIBANK", 1248, 1.4, 7640000, 8.7),
-    ("BAJFINANCE", 7240, 3.2, 2110000, 7.8),
-    ("HDFCBANK", 1680, 0.9, 9820000, 4.1),
-    ("TATAMOTORS", 985, -1.2, 6210000, 5.3),
-    ("MARUTI", 12980, -1.5, 640000, 3.1),
-    ("INFY", 1890, -0.6, 5540000, -3.4),
-    ("TATASTEEL", 162, -0.8, 7120000, -2.7),
-    ("AXISBANK", 1156, 0.4, 4380000, -4.9),
+OI_SYMBOLS = [
+    "RELIANCE", "SBIN", "ICICIBANK", "BAJFINANCE", "HDFCBANK",
+    "TATAMOTORS", "MARUTI", "INFY", "TATASTEEL", "AXISBANK",
 ]
-
-OI_SYMBOLS = [s for s, *_ in SAMPLE_OI]
 DHAN_QUOTE_URL = "https://api.dhan.co/v2/marketfeed/quote"
 DHAN_HIST_URL = "https://api.dhan.co/v2/charts/historical"
 DHAN_SCRIP_URL = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
@@ -87,9 +77,34 @@ def _dhan_creds() -> tuple[str, str]:
         return "", ""
 
 
-def _sample_oi() -> list[dict]:
-    return [{"sym": s, "ltp": l, "price_chg": pc, "oi": oi, "oi_chg": oc}
-            for s, l, pc, oi, oc in SAMPLE_OI]
+@st.cache_data(ttl=60, show_spinner=False)
+def _yf_oi_prices(symbols: tuple[str, ...]) -> list[dict]:
+    """Live LTP + price change from yfinance (no auth). OI needs a Dhan feed,
+    so it is returned as None here and shown as '-' rather than a stale guess."""
+    rows = []
+    for sym in symbols:
+        try:
+            tk = yf.Ticker(f"{sym}.NS")
+            ltp = prev = None
+            try:
+                fi = tk.fast_info
+                ltp = fi.get("last_price") if hasattr(fi, "get") else getattr(fi, "last_price", None)
+                prev = fi.get("previous_close") if hasattr(fi, "get") else getattr(fi, "previous_close", None)
+            except Exception:
+                pass
+            if ltp is None or prev is None:
+                h = tk.history(period="5d")["Close"].dropna()
+                if len(h) >= 2:
+                    ltp, prev = float(h.iloc[-1]), float(h.iloc[-2])
+            if ltp is None or not prev:
+                continue
+            rows.append({"sym": sym, "ltp": float(ltp),
+                         "price_chg": (float(ltp) / float(prev) - 1) * 100,
+                         "oi": None, "oi_chg": None})
+        except Exception:
+            continue
+    rows.sort(key=lambda r: r["price_chg"], reverse=True)
+    return rows
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -131,16 +146,19 @@ def _dhan_fut_map(symbols: tuple[str, ...]) -> dict:
         return {}
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def get_oi_buildup() -> tuple[list[dict], bool]:
-    """Return (rows, is_live). Uses Dhan when a token is configured, else sample data."""
+@st.cache_data(ttl=60, show_spinner=False)
+def get_oi_buildup() -> tuple[list[dict], str]:
+    """Return (rows, source). source: 'dhan' = live price+OI, 'yf' = live price
+    only (no OI feed), 'none' = nothing reachable. Never returns invented data."""
     cid, tok = _dhan_creds()
     if not cid or not tok:
-        return _sample_oi(), False
+        rows = _yf_oi_prices(tuple(OI_SYMBOLS))
+        return rows, ("yf" if rows else "none")
     try:
         secmap = _dhan_fut_map(tuple(OI_SYMBOLS))
         if not secmap:
-            return _sample_oi(), False
+            rows = _yf_oi_prices(tuple(OI_SYMBOLS))
+            return rows, ("yf" if rows else "none")
         headers = {"access-token": tok, "client-id": cid,
                    "Content-Type": "application/json", "Accept": "application/json"}
         ids = list(secmap.values())
@@ -173,14 +191,18 @@ def get_oi_buildup() -> tuple[list[dict], bool]:
                          "oi": int(oi),
                          "oi_chg": (float(oi) / float(prev_oi) - 1) * 100})
         if not rows:
-            return _sample_oi(), False
+            _rows = _yf_oi_prices(tuple(OI_SYMBOLS))
+            return _rows, ("yf" if _rows else "none")
         rows.sort(key=lambda r: r["oi_chg"], reverse=True)
-        return rows, True
+        return rows, "dhan"
     except Exception:
-        return _sample_oi(), False
+        rows = _yf_oi_prices(tuple(OI_SYMBOLS))
+        return rows, ("yf" if rows else "none")
 
 
-def oi_signal(price_chg: float, oi_chg: float) -> tuple[str, str]:
+def oi_signal(price_chg: float, oi_chg) -> tuple[str, str]:
+    if oi_chg is None:
+        return ("-", "#9AA7B2")
     if oi_chg >= 0:
         return ("Long Buildup", "#0B7A4B") if price_chg >= 0 else ("Short Buildup", "#B3261E")
     return ("Short Covering", "#0E7C86") if price_chg >= 0 else ("Long Unwinding", "#C77A0B")
@@ -1154,11 +1176,17 @@ if view == "News":
     st.stop()
 
 if view == "Stock OI":
-    _oi_rows_data, _oi_live = get_oi_buildup()
+    _oi_rows_data, _oi_src = get_oi_buildup()
     st.markdown("### Open interest — buildup")
-    st.caption(("Live via Dhan API. " if _oi_live else "Sample data — add your Dhan "
-                "token in app secrets for live values. ")
-               + "Rise in OI with rise in price = long buildup.")
+    _now_ist = (dt.datetime.utcnow() + dt.timedelta(hours=5, minutes=30)).strftime("%d %b %Y, %H:%M IST")
+    if _oi_src == "dhan":
+        _cap = f"Live prices &amp; OI via Dhan API - {_now_ist}. "
+    elif _oi_src == "yf":
+        _cap = (f"Live prices via public market feed - {_now_ist}. "
+                "OI needs a Dhan token in app secrets (shown as - until then). ")
+    else:
+        _cap = "Live market feed is unreachable right now - no data shown. "
+    st.caption(_cap + "Rise in OI with rise in price = long buildup.")
     _oi_head = "".join(f'<th class="th-{a}">{h}</th>' for h, a in [
         ("Stock Symbol", "l"), ("LTP", "r"), ("Rise In Price", "r"),
         ("Open Interest", "r"), ("Rise In OI", "r"), ("Signal", "c")])
@@ -1167,14 +1195,16 @@ if view == "Stock OI":
         _pc, _oc = _r["price_chg"], _r["oi_chg"]
         _sig, _sc = oi_signal(_pc, _oc)
         _pcl = "#0B7A4B" if _pc >= 0 else "#B3261E"
-        _ocl = "#0B7A4B" if _oc >= 0 else "#B3261E"
+        _ocl = "#0B7A4B" if (_oc is not None and _oc >= 0) else "#B3261E"
+        _oi_txt = f'{int(_r["oi"]):,}' if _r["oi"] is not None else "-"
+        _oc_txt = f'{_oc:+.2f}%' if _oc is not None else "-"
         _oi_rows.append(
             "<tr>"
             f'<td><a class="c-sym" href="?view=oi&stock={_r["sym"]}" target="_self">{_r["sym"]}</a></td>'
             f'<td class="c-num">{_r["ltp"]:,.2f}</td>'
             f'<td class="c-num" style="color:{_pcl};font-weight:600">{_pc:+.2f}%</td>'
-            f'<td class="c-num c-muted">{int(_r["oi"]):,}</td>'
-            f'<td class="c-num" style="color:{_ocl};font-weight:600">{_oc:+.2f}%</td>'
+            f'<td class="c-num c-muted">{_oi_txt}</td>'
+            f'<td class="c-num" style="color:{_ocl};font-weight:600">{_oc_txt}</td>'
             f'<td class="c-reco"><span class="pill" style="background:{_sc}">{_sig}</span></td>'
             "</tr>")
     st.markdown(
