@@ -1133,21 +1133,17 @@ def _inject_ga() -> None:
     if not gid:
         return
     components.html(f"""
+        <!-- Google tag (gtag.js) -->
+        <script async src="https://www.googletagmanager.com/gtag/js?id={gid}"></script>
         <script>
-        (function() {{
-          var d = window.parent.document;
-          if (d.getElementById('ga4-lib')) return;
-          var s = d.createElement('script');
-          s.id = 'ga4-lib'; s.async = true;
-          s.src = 'https://www.googletagmanager.com/gtag/js?id={gid}';
-          d.head.appendChild(s);
-          var w = window.parent;
-          w.dataLayer = w.dataLayer || [];
-          function gtag(){{ w.dataLayer.push(arguments); }}
-          w.gtag = gtag;
+          window.dataLayer = window.dataLayer || [];
+          function gtag(){{ dataLayer.push(arguments); }}
           gtag('js', new Date());
-          gtag('config', '{gid}');
-        }})();
+          var ref = document.referrer || 'https://stockmerit.streamlit.app';
+          gtag('config', '{gid}', {{
+            page_location: ref,
+            page_referrer: ref
+          }});
         </script>
     """, height=0)
 
