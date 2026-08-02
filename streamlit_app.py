@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import datetime as dt
 import html as _html
+import json
+import uuid
 import io
 import re
 import time
@@ -354,9 +356,11 @@ div[role="dialog"] .sec-label{ margin:0 0 4px; }
 /* --- custom results table (matches the prototype) --- */
 .sh-tablewrap{ border:1px solid #E5ECF1; border-radius:12px; overflow-x:auto; margin-top:6px; }
 .sh-table{ width:100%; border-collapse:collapse; }
+.sh-tablewrap{ max-height:72vh; overflow:auto; }
 .sh-table thead th{ background:#F5F8FA; padding:11px 14px; font-size:0.68rem;
   text-transform:uppercase; letter-spacing:0.07em; color:var(--muted); font-weight:600;
-  white-space:nowrap; }
+  white-space:nowrap; position:sticky; top:0; z-index:3;
+  box-shadow:inset 0 -1px 0 #DDE6ED; }
 .sh-table .th-r{ text-align:right; } .sh-table .th-c{ text-align:center; }
 .sh-table .th-l{ text-align:left; }
 .sh-table td{ padding:12px 14px; border-top:1px solid #EEF3F6; white-space:nowrap;
@@ -373,6 +377,8 @@ div[role="dialog"] .sec-label{ margin:0 0 4px; }
 .sh-table .c-num{ font-family:'IBM Plex Mono',monospace; text-align:right; }
 .sh-table .c-muted{ color:var(--muted); }
 .sh-table .c-rsi{ font-weight:600; font-size:0.9rem; }
+.sh-table .c-vwap{ cursor:help; }
+.stat{ resize:both; overflow:auto; min-width:120px; min-height:70px; }
 .sh-table .c-reco{ text-align:center; }
 .sh-table .pill{ font-family:'IBM Plex Mono',monospace; font-size:0.68rem; font-weight:600;
   padding:3px 9px; border-radius:6px; color:#FFF; white-space:nowrap; }
@@ -1111,11 +1117,97 @@ def detail_dialog(symbol: str):
 ''', height=0)
 
 
+# ------------------------------ visitor stats -----------------------------
+_STATS_FILE = "visitor_stats.json"
+
+
+def _inject_ga() -> None:
+    """Load Google Analytics 4 into the top-level page. Free, durable, and the
+    dashboard (unique users, live users, geography) is private to your GA login.
+    Set GA_MEASUREMENT_ID = 'G-XXXXXXX' in app secrets to enable."""
+    try:
+        gid = str(st.secrets.get("GA_MEASUREMENT_ID", "")).strip()
+    except Exception:
+        gid = ""
+    if not gid:
+        return
+    components.html(f"""
+        <script>
+        (function() {{
+          var d = window.parent.document;
+          if (d.getElementById('ga4-lib')) return;
+          var s = d.createElement('script');
+          s.id = 'ga4-lib'; s.async = true;
+          s.src = 'https://www.googletagmanager.com/gtag/js?id={gid}';
+          d.head.appendChild(s);
+          var w = window.parent;
+          w.dataLayer = w.dataLayer || [];
+          function gtag(){{ w.dataLayer.push(arguments); }}
+          w.gtag = gtag;
+          gtag('js', new Date());
+          gtag('config', '{gid}');
+        }})();
+        </script>
+    """, height=0)
+
+
+def _track_and_get_stats() -> dict:
+    """Count unique browsers (via a first-party cookie) and total page hits.
+    Stored in a local JSON file. Ephemeral on Streamlit Cloud - see notes."""
+    try:
+        with open(_STATS_FILE) as fh:
+            data = json.load(fh)
+    except Exception:
+        data = {"unique": [], "hits": 0}
+    vid = None
+    try:
+        vid = st.context.cookies.get("sm_vid")
+    except Exception:
+        pass
+    if not vid:
+        vid = uuid.uuid4().hex
+        components.html(
+            f"<script>document.cookie='sm_vid={vid};max-age=31536000;path=/;SameSite=Lax';</script>",
+            height=0)
+    if vid not in data["unique"]:
+        data["unique"].append(vid)
+    data["hits"] = int(data.get("hits", 0)) + 1
+    try:
+        with open(_STATS_FILE, "w") as fh:
+            json.dump(data, fh)
+    except Exception:
+        pass
+    return data
+
+
+def _maybe_show_admin_stats() -> None:
+    try:
+        key = str(st.secrets.get("ADMIN_KEY", "")).strip()
+    except Exception:
+        key = ""
+    if not key or str(st.query_params.get("admin", "")) != key:
+        return
+    try:
+        with open(_STATS_FILE) as fh:
+            d = json.load(fh)
+    except Exception:
+        d = {"unique": [], "hits": 0}
+    c1, c2 = st.columns(2)
+    c1.metric("Unique visitors", f"{len(d.get('unique', [])):,}")
+    c2.metric("Total page hits", f"{int(d.get('hits', 0)):,}")
+    st.caption("Visible only with your private ?admin key. Counts reset if the "
+               "app is redeployed (ephemeral storage).")
+
+
 # ---------------------------------- app -----------------------------------
 
 st.set_page_config(page_title="StockMerit — NSE RSI Screener",
                    page_icon="📊", layout="wide")
 st.markdown(CSS, unsafe_allow_html=True)
+
+_inject_ga()
+_track_and_get_stats()
+_maybe_show_admin_stats()
 
 
 def _valid_symbol(sym: str) -> bool:
@@ -1139,6 +1231,24 @@ st.markdown(
     f'<div class="band-date">{dt.date.today().strftime("%d-%m-%Y")}</div></div>',
     unsafe_allow_html=True)
 
+def _open_in_screener(sym: str) -> None:
+    """Show a searched stock as a one-row screener result. The user then clicks
+    the symbol to open its detail page (the regular flow)."""
+    _sy = sym.strip().upper()
+    if not _valid_symbol(_sy):
+        return
+    st.session_state["results"] = scan((f"{_sy}.NS",), 0.0, 1)
+    st.session_state["scanned"] = 1
+    st.session_state["threshold"] = 0
+    st.session_state["view"] = "Screener"
+    st.session_state.pop("qp_opened", None)
+    if "stock" in st.query_params:
+        del st.query_params["stock"]
+    if "scan" in st.query_params:
+        del st.query_params["scan"]
+    st.rerun()
+
+
 # --- global stock search (moved out of the sidebar, sits under the header) ---
 _sp, _sbox = st.columns([2, 1], gap="large")
 with _sbox:
@@ -1150,14 +1260,14 @@ with _sbox:
                                label_visibility="collapsed")
         if _picked and st.session_state.get("last_search") != _picked:
             st.session_state["last_search"] = _picked
-            detail_dialog(_picked)
+            _open_in_screener(_picked)
     else:
         _typed = st.text_input(" ", placeholder="🔍  Search any stock…",
                                label_visibility="collapsed")
         _tv = _typed.strip().upper()
         if _tv and _valid_symbol(_tv) and st.session_state.get("last_search") != _tv:
             st.session_state["last_search"] = _tv
-            detail_dialog(_tv)
+            _open_in_screener(_tv)
 
 # --- live-tick settings (kept in code; no sidebar UI) ---
 live_on = True
@@ -1330,6 +1440,12 @@ elif results.empty:
     st.warning(f"Nothing is at RSI {st.session_state.get('threshold', threshold)} or "
                "above right now. Lower the threshold or widen the stock list.")
 else:
+    _all_bs = [b for b in ["Buy", "Sell", "Hold", "Neutral"]
+               if b in set(results["Buy/Sell"].astype(str))]
+    _fc1, _fc2 = st.columns([1, 3], gap="small")
+    _bs_choice = _fc1.selectbox("Buy/Sell filter", ["All"] + _all_bs, index=0)
+    if _bs_choice != "All":
+        results = results[results["Buy/Sell"].astype(str) == _bs_choice]
     hleft, hright = st.columns([4, 1], gap="small")
     hleft.markdown(f"**{len(results)} stocks** at RSI "
                    f"{st.session_state.get('threshold', threshold)} or above, "
@@ -1361,6 +1477,8 @@ else:
                    f"200-day SMA: {_sv(r.get('_SMA200'))}")
         _pe = _sv(r.get("PE"))
         _secpe = _sv(r.get("Sec PE"))
+        _vw_tip = ("VWAP = SUM(close x volume) / SUM(volume) over the last 20 sessions. "
+                   f'Closing price is {r["VWAP"]} the 20-day VWAP.')
         body_rows.append(
             "<tr>"
             f'<td class="c-date">{r["Date"]}</td>'
@@ -1369,7 +1487,7 @@ else:
             f'<td class="c-num c-price" title="{sma_tip}">{_fmt(r["Current Price (Rs)"])}</td>'
             f'<td class="c-num c-muted">{_vol(r.get("Volume"))}</td>'
             f'<td class="c-num c-rsi" style="color:{rsi_color(rsi)}">{rsi_txt}</td>'
-            f'<td class="c-vwap" style="text-align:center;font-weight:600;'
+            f'<td class="c-vwap" title="{_vw_tip}" style="text-align:center;font-weight:600;'
             f'color:{"#0B7A4B" if r["VWAP"]=="Above" else "#B3261E" if r["VWAP"]=="Below" else "#5E6E7E"}">'
             f'{r["VWAP"]}</td>'
             f'<td class="c-num">{_pe}</td>'
