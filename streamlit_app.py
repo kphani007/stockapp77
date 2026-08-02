@@ -1125,10 +1125,11 @@ def _inject_ga() -> None:
     """Load Google Analytics 4 into the top-level page. Free, durable, and the
     dashboard (unique users, live users, geography) is private to your GA login.
     Set GA_MEASUREMENT_ID = 'G-XXXXXXX' in app secrets to enable."""
+    gid = "G-FL4MEDNP7H"
     try:
-        gid = str(st.secrets.get("GA_MEASUREMENT_ID", "")).strip()
+        gid = str(st.secrets.get("GA_MEASUREMENT_ID", "")).strip() or gid
     except Exception:
-        gid = ""
+        pass
     if not gid:
         return
     components.html(f"""
