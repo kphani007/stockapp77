@@ -436,6 +436,11 @@ div[role="dialog"] .sec-label{ margin:0 0 4px; }
 .sh-table a.c-sym{ font-family:'IBM Plex Mono',monospace; font-weight:600; font-size:0.86rem;
   color:var(--teal); text-decoration:none; }
 .sh-table a.c-sym:hover{ text-decoration:underline; }
+/* freeze the Stock Symbol column (2nd) when scrolling sideways */
+.sh-table thead th:nth-child(2){ position:sticky; left:0; z-index:4; background:#F5F8FA; }
+.sh-table tbody td:nth-child(2){ position:sticky; left:0; z-index:2; background:#FFF;
+  box-shadow:1px 0 0 #EEF3F6; }
+.sh-table tbody tr:hover td:nth-child(2){ background:#F5F8FA; }
 .sh-table .c-price{ text-decoration:underline dotted; text-underline-offset:3px;
   text-decoration-color:#9BB4C4; cursor:help; }
 .sh-table .c-sec{ font-weight:500; }
@@ -889,11 +894,23 @@ def fetch_indices(bucket: int = 0) -> list[dict]:
     out = []
     for name, tk in specs:
         try:
-            h = yf.Ticker(tk).history(period="5d")["Close"].dropna()
-            if len(h) >= 2:
-                val = float(h.iloc[-1])
-                chg = (val / float(h.iloc[-2]) - 1) * 100
-                out.append({"name": name, "value": val, "chg": chg})
+            t = yf.Ticker(tk)
+            val = prev = None
+            # intraday first so the strip actually moves during the session
+            try:
+                intr = t.history(period="1d", interval="1m")["Close"].dropna()
+                if not intr.empty:
+                    val = float(intr.iloc[-1])
+            except Exception:
+                pass
+            d = t.history(period="5d")["Close"].dropna()
+            if len(d) >= 1:
+                prev = float(d.iloc[-2]) if len(d) >= 2 else float(d.iloc[-1])
+                if val is None:
+                    val = float(d.iloc[-1])
+            if val is None or prev is None:
+                continue
+            out.append({"name": name, "value": val, "chg": (val / prev - 1) * 100})
         except Exception:
             continue
     return out
@@ -1300,7 +1317,7 @@ st.markdown(
     '<span style="color:#FFFFFF;font-family:Georgia,serif;font-style:italic;'
     'font-weight:600;padding:0 1px">Mer</span>'
     '<span style="color:#5CA8FF">it</span></span></div>'
-    '<div class="band-sub">Analyze at one place …</div></div>'
+    '<div class="band-sub">Stock it. Analyze it.</div></div>'
     f'<div class="band-date">{dt.date.today().strftime("%d-%m-%Y")}</div></div>',
     unsafe_allow_html=True)
 
@@ -1435,7 +1452,8 @@ def render_indices_strip():
                 unsafe_allow_html=True)
     _ts = dt.datetime.now(IST).strftime("%H:%M:%S")
     if _live_active:
-        st.caption(f"🟢 Live · updated {_ts} IST · refreshing every {int(live_every)}s")
+        st.caption(f"🟢 Live (may be delayed ~15 min) · updated {_ts} IST · "
+                   f"refreshing every {max(int(live_every), 5)}s")
     elif live_on:
         st.caption(f"⚪ Market closed · showing last close ({_ts} IST)")
     else:
@@ -1516,12 +1534,53 @@ elif results.empty:
     st.warning(f"Nothing is at RSI {st.session_state.get('threshold', threshold)} or "
                "above right now. Lower the threshold or widen the stock list.")
 else:
-    _all_bs = [b for b in ["Buy", "Sell", "Hold", "Neutral"]
-               if b in set(results["Buy/Sell"].astype(str))]
-    _fc1, _fc2 = st.columns([1, 3], gap="small")
-    _bs_choice = _fc1.selectbox("Buy/Sell filter", ["All"] + _all_bs, index=0)
-    if _bs_choice != "All":
-        results = results[results["Buy/Sell"].astype(str) == _bs_choice]
+    # --- filters: Buy/Sell + Sector + Filter button. State lives in the URL
+    # (like the scan config) so opening a stock detail keeps the filtered view
+    # intact and never re-scans. ---
+    _bs_vals = sorted(v for v in results["Buy/Sell"].astype(str).unique()
+                      if v not in ("n/a", "not loaded", "None", ""))
+    _sec_vals = sorted(v for v in results["Sector"].astype(str).unique()
+                       if v not in ("n/a", "not loaded", "None", ""))
+    _bs_opts = ["All"] + _bs_vals
+    _sec_opts = ["All"] + _sec_vals
+
+    _cur_bs = str(st.query_params.get("bs", "All"))
+    _cur_sec = str(st.query_params.get("sec", "All"))
+    if _cur_bs not in _bs_opts:
+        _cur_bs = "All"
+    if _cur_sec not in _sec_opts:
+        _cur_sec = "All"
+
+    _fc1, _fc2, _fc3, _fc4 = st.columns([2, 2, 1, 1], gap="small")
+    _bs_sel = _fc1.selectbox("Buy/Sell", _bs_opts,
+                             index=_bs_opts.index(_cur_bs), key="flt_bs")
+    _sec_sel = _fc2.selectbox("Sector", _sec_opts,
+                              index=_sec_opts.index(_cur_sec), key="flt_sec")
+    _fc3.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+    _apply = _fc3.button("Filter", type="primary", use_container_width=True)
+    _fc4.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+    _clearf = _fc4.button("Reset", use_container_width=True)
+
+    if _apply:
+        if _bs_sel == "All":
+            st.query_params.pop("bs", None)
+        else:
+            st.query_params["bs"] = _bs_sel
+        if _sec_sel == "All":
+            st.query_params.pop("sec", None)
+        else:
+            st.query_params["sec"] = _sec_sel
+        st.rerun()
+    if _clearf:
+        st.query_params.pop("bs", None)
+        st.query_params.pop("sec", None)
+        st.rerun()
+
+    # apply the URL-backed filters (source of truth, survives the detail reload)
+    if _cur_bs != "All":
+        results = results[results["Buy/Sell"].astype(str) == _cur_bs]
+    if _cur_sec != "All":
+        results = results[results["Sector"].astype(str) == _cur_sec]
     hleft, hright = st.columns([4, 1], gap="small")
     hleft.markdown(f"**{len(results)} stocks** at RSI "
                    f"{st.session_state.get('threshold', threshold)} or above, "
@@ -1539,13 +1598,19 @@ else:
         f'<th class="th-{a}">{COL_LABELS.get(h, h)}</th>' for h, a in zip(HEADERS, aligns))
 
     _cfgq = quote(st.query_params.get("scan", ""), safe="")
+    _fq = ""
+    if _cur_bs != "All":
+        _fq += f"&bs={quote(_cur_bs, safe='')}"
+    if _cur_sec != "All":
+        _fq += f"&sec={quote(_cur_sec, safe='')}"
     body_rows = []
     for _, r in results.iterrows():
         sym = r["Stock Symbol"]
         rsi = r["RSI"]
         reco = r["Buy/Sell"]
         rsi_txt = f"{rsi:.1f}" if isinstance(rsi, (int, float)) else str(rsi)
-        href = f"?scan={_cfgq}&stock={sym}" if _cfgq else f"?stock={sym}"
+        href = (f"?scan={_cfgq}{_fq}&stock={sym}" if _cfgq
+                else f"?{_fq[1:]}&stock={sym}" if _fq else f"?stock={sym}")
         _sv = lambda v: f"{v:,.2f}" if isinstance(v, (int, float)) else "n/a"
         _vol = lambda v: f"{int(v):,}" if isinstance(v, (int, float)) else "n/a"
         sma_tip = (f"20-day SMA: {_sv(r.get('_SMA20'))}  |  "
