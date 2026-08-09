@@ -148,19 +148,86 @@ def _dhan_fut_map(symbols: tuple[str, ...]) -> dict:
         return {}
 
 
+_NSE_HOME = "https://www.nseindia.com"
+_NSE_QUOTE_DERIV = "https://www.nseindia.com/api/quote-derivative?symbol={}"
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _nse_oi_prices(symbols: tuple[str, ...]) -> list[dict]:
+    """Best-effort real OI + price from NSE's public F&O feed (no auth needed).
+    NSE blocks many datacenter IPs, so this often returns [] from cloud hosts;
+    callers then fall back to price-only. Never returns invented data."""
+    sess = requests.Session()
+    sess.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.nseindia.com/",
+    })
+    try:  # seed cookies the way a browser would before hitting the API
+        sess.get(_NSE_HOME, timeout=6)
+        sess.get(_NSE_HOME + "/option-chain", timeout=6)
+    except Exception:
+        return []
+    rows = []
+    for sym in symbols:
+        try:
+            r = sess.get(_NSE_QUOTE_DERIV.format(quote(sym)), timeout=6)
+            if r.status_code != 200:
+                continue
+            stocks = (r.json() or {}).get("stocks") or []
+            fut = []
+            for s in stocks:
+                meta = s.get("metadata") or {}
+                if "fut" in str(meta.get("instrumentType", "")).lower():
+                    fut.append((meta, s.get("marketDeptOrderBook") or {}))
+            if not fut:
+                continue
+            def _expkey(m):  # parse "DD-Mon-YYYY" so nearest expiry sorts first
+                try:
+                    return dt.datetime.strptime(str(m[0].get("expiryDate", "")), "%d-%b-%Y")
+                except Exception:
+                    return dt.datetime.max
+            fut.sort(key=_expkey)  # nearest expiry first
+            meta, mdob = fut[0]
+            ltp = meta.get("lastPrice")
+            pchg = meta.get("pChange")
+            tinfo = mdob.get("tradeInfo") or {}
+            oi = tinfo.get("openInterest")
+            oichg = tinfo.get("pchangeinOpenInterest")
+            if None in (ltp, pchg, oi, oichg):
+                continue
+            rows.append({"sym": sym, "ltp": float(ltp), "price_chg": float(pchg),
+                         "oi": int(float(oi)), "oi_chg": float(oichg)})
+        except Exception:
+            continue
+    rows.sort(key=lambda r: r["oi_chg"], reverse=True)
+    return rows
+
+
+def _no_token_oi() -> tuple[list[dict], str]:
+    """Fallback chain when Dhan is unavailable: real NSE OI first, then
+    price-only from the public feed, then nothing. Never invents data."""
+    rows = _nse_oi_prices(tuple(OI_SYMBOLS))
+    if rows:
+        return rows, "nse"
+    rows = _yf_oi_prices(tuple(OI_SYMBOLS))
+    return rows, ("yf" if rows else "none")
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def get_oi_buildup() -> tuple[list[dict], str]:
-    """Return (rows, source). source: 'dhan' = live price+OI, 'yf' = live price
-    only (no OI feed), 'none' = nothing reachable. Never returns invented data."""
+    """Return (rows, source). source: 'dhan' = live price+OI via Dhan,
+    'nse' = live price+OI via NSE public feed, 'yf' = live price only,
+    'none' = nothing reachable. Never returns invented data."""
     cid, tok = _dhan_creds()
     if not cid or not tok:
-        rows = _yf_oi_prices(tuple(OI_SYMBOLS))
-        return rows, ("yf" if rows else "none")
+        return _no_token_oi()
     try:
         secmap = _dhan_fut_map(tuple(OI_SYMBOLS))
         if not secmap:
-            rows = _yf_oi_prices(tuple(OI_SYMBOLS))
-            return rows, ("yf" if rows else "none")
+            return _no_token_oi()
         headers = {"access-token": tok, "client-id": cid,
                    "Content-Type": "application/json", "Accept": "application/json"}
         ids = list(secmap.values())
@@ -193,13 +260,11 @@ def get_oi_buildup() -> tuple[list[dict], str]:
                          "oi": int(oi),
                          "oi_chg": (float(oi) / float(prev_oi) - 1) * 100})
         if not rows:
-            _rows = _yf_oi_prices(tuple(OI_SYMBOLS))
-            return _rows, ("yf" if _rows else "none")
+            return _no_token_oi()
         rows.sort(key=lambda r: r["oi_chg"], reverse=True)
         return rows, "dhan"
     except Exception:
-        rows = _yf_oi_prices(tuple(OI_SYMBOLS))
-        return rows, ("yf" if rows else "none")
+        return _no_token_oi()
 
 
 def oi_signal(price_chg: float, oi_chg) -> tuple[str, str]:
@@ -843,9 +908,19 @@ def scan(tickers: tuple[str, ...], threshold: float, fetch_fund_limit: int) -> p
         chunk = list(tickers[i:i + batch])
         data = yf.download(chunk, period="1y", interval="1d", group_by="ticker",
                            auto_adjust=False, threads=True, progress=False)
+        _multi = isinstance(data.columns, pd.MultiIndex)
         for sym in chunk:
             try:
-                df = data[sym] if len(chunk) > 1 else data
+                if _multi:
+                    _lvl0 = data.columns.get_level_values(0)
+                    if sym in _lvl0:
+                        df = data[sym]
+                    elif sym in data.columns.get_level_values(-1):
+                        df = data.xs(sym, axis=1, level=-1)
+                    else:
+                        continue
+                else:
+                    df = data
                 c = df["Close"].dropna()
                 if c.empty:
                     continue
@@ -1221,9 +1296,10 @@ st.markdown(
     'stroke-linecap="round" stroke-linejoin="round"/>'
     '<path d="M20 8 H28 V16" stroke="url(#smg)" stroke-width="3.4" '
     'stroke-linecap="round" stroke-linejoin="round"/></svg></span>'
-    '<span style="letter-spacing:-0.02em"><span style="color:#FFFFFF">Stock</span>'
-    '<span style="color:#5CA8FF">Mer</span>'
-    '<span style="color:#FFFFFF">it</span></span></div>'
+    '<span style="letter-spacing:-0.02em"><span style="color:#5CA8FF">Stock</span>'
+    '<span style="color:#FFFFFF;font-family:Georgia,serif;font-style:italic;'
+    'font-weight:600;padding:0 1px">Mer</span>'
+    '<span style="color:#5CA8FF">it</span></span></div>'
     '<div class="band-sub">Analyze at one place …</div></div>'
     f'<div class="band-date">{dt.date.today().strftime("%d-%m-%Y")}</div></div>',
     unsafe_allow_html=True)
@@ -1306,9 +1382,12 @@ if view == "Stock OI":
     _now_ist = (dt.datetime.utcnow() + dt.timedelta(hours=5, minutes=30)).strftime("%d %b %Y, %H:%M IST")
     if _oi_src == "dhan":
         _cap = f"Live prices &amp; OI via Dhan API - {_now_ist}. "
+    elif _oi_src == "nse":
+        _cap = (f"Live prices &amp; OI via NSE public feed - {_now_ist}. "
+                "May be delayed or briefly unavailable. ")
     elif _oi_src == "yf":
         _cap = (f"Live prices via public market feed - {_now_ist}. "
-                "OI needs a Dhan token in app secrets (shown as - until then). ")
+                "Open interest feed is temporarily unavailable (shown as -). ")
     else:
         _cap = "Live market feed is unreachable right now - no data shown. "
     st.caption(_cap + "Rise in OI with rise in price = long buildup.")
