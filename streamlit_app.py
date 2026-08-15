@@ -148,86 +148,19 @@ def _dhan_fut_map(symbols: tuple[str, ...]) -> dict:
         return {}
 
 
-_NSE_HOME = "https://www.nseindia.com"
-_NSE_QUOTE_DERIV = "https://www.nseindia.com/api/quote-derivative?symbol={}"
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def _nse_oi_prices(symbols: tuple[str, ...]) -> list[dict]:
-    """Best-effort real OI + price from NSE's public F&O feed (no auth needed).
-    NSE blocks many datacenter IPs, so this often returns [] from cloud hosts;
-    callers then fall back to price-only. Never returns invented data."""
-    sess = requests.Session()
-    sess.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/122.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.nseindia.com/",
-    })
-    try:  # seed cookies the way a browser would before hitting the API
-        sess.get(_NSE_HOME, timeout=6)
-        sess.get(_NSE_HOME + "/option-chain", timeout=6)
-    except Exception:
-        return []
-    rows = []
-    for sym in symbols:
-        try:
-            r = sess.get(_NSE_QUOTE_DERIV.format(quote(sym)), timeout=6)
-            if r.status_code != 200:
-                continue
-            stocks = (r.json() or {}).get("stocks") or []
-            fut = []
-            for s in stocks:
-                meta = s.get("metadata") or {}
-                if "fut" in str(meta.get("instrumentType", "")).lower():
-                    fut.append((meta, s.get("marketDeptOrderBook") or {}))
-            if not fut:
-                continue
-            def _expkey(m):  # parse "DD-Mon-YYYY" so nearest expiry sorts first
-                try:
-                    return dt.datetime.strptime(str(m[0].get("expiryDate", "")), "%d-%b-%Y")
-                except Exception:
-                    return dt.datetime.max
-            fut.sort(key=_expkey)  # nearest expiry first
-            meta, mdob = fut[0]
-            ltp = meta.get("lastPrice")
-            pchg = meta.get("pChange")
-            tinfo = mdob.get("tradeInfo") or {}
-            oi = tinfo.get("openInterest")
-            oichg = tinfo.get("pchangeinOpenInterest")
-            if None in (ltp, pchg, oi, oichg):
-                continue
-            rows.append({"sym": sym, "ltp": float(ltp), "price_chg": float(pchg),
-                         "oi": int(float(oi)), "oi_chg": float(oichg)})
-        except Exception:
-            continue
-    rows.sort(key=lambda r: r["oi_chg"], reverse=True)
-    return rows
-
-
-def _no_token_oi() -> tuple[list[dict], str]:
-    """Fallback chain when Dhan is unavailable: real NSE OI first, then
-    price-only from the public feed, then nothing. Never invents data."""
-    rows = _nse_oi_prices(tuple(OI_SYMBOLS))
-    if rows:
-        return rows, "nse"
-    rows = _yf_oi_prices(tuple(OI_SYMBOLS))
-    return rows, ("yf" if rows else "none")
-
-
 @st.cache_data(ttl=60, show_spinner=False)
 def get_oi_buildup() -> tuple[list[dict], str]:
-    """Return (rows, source). source: 'dhan' = live price+OI via Dhan,
-    'nse' = live price+OI via NSE public feed, 'yf' = live price only,
-    'none' = nothing reachable. Never returns invented data."""
+    """Return (rows, source). source: 'dhan' = live price+OI, 'yf' = live price
+    only (no OI feed), 'none' = nothing reachable. Never returns invented data."""
     cid, tok = _dhan_creds()
     if not cid or not tok:
-        return _no_token_oi()
+        rows = _yf_oi_prices(tuple(OI_SYMBOLS))
+        return rows, ("yf" if rows else "none")
     try:
         secmap = _dhan_fut_map(tuple(OI_SYMBOLS))
         if not secmap:
-            return _no_token_oi()
+            rows = _yf_oi_prices(tuple(OI_SYMBOLS))
+            return rows, ("yf" if rows else "none")
         headers = {"access-token": tok, "client-id": cid,
                    "Content-Type": "application/json", "Accept": "application/json"}
         ids = list(secmap.values())
@@ -260,11 +193,13 @@ def get_oi_buildup() -> tuple[list[dict], str]:
                          "oi": int(oi),
                          "oi_chg": (float(oi) / float(prev_oi) - 1) * 100})
         if not rows:
-            return _no_token_oi()
+            _rows = _yf_oi_prices(tuple(OI_SYMBOLS))
+            return _rows, ("yf" if _rows else "none")
         rows.sort(key=lambda r: r["oi_chg"], reverse=True)
         return rows, "dhan"
     except Exception:
-        return _no_token_oi()
+        rows = _yf_oi_prices(tuple(OI_SYMBOLS))
+        return rows, ("yf" if rows else "none")
 
 
 def oi_signal(price_chg: float, oi_chg) -> tuple[str, str]:
@@ -436,11 +371,6 @@ div[role="dialog"] .sec-label{ margin:0 0 4px; }
 .sh-table a.c-sym{ font-family:'IBM Plex Mono',monospace; font-weight:600; font-size:0.86rem;
   color:var(--teal); text-decoration:none; }
 .sh-table a.c-sym:hover{ text-decoration:underline; }
-/* freeze the Stock Symbol column (2nd) when scrolling sideways */
-.sh-table thead th:nth-child(2){ position:sticky; left:0; z-index:4; background:#F5F8FA; }
-.sh-table tbody td:nth-child(2){ position:sticky; left:0; z-index:2; background:#FFF;
-  box-shadow:1px 0 0 #EEF3F6; }
-.sh-table tbody tr:hover td:nth-child(2){ background:#F5F8FA; }
 .sh-table .c-price{ text-decoration:underline dotted; text-underline-offset:3px;
   text-decoration-color:#9BB4C4; cursor:help; }
 .sh-table .c-sec{ font-weight:500; }
@@ -894,23 +824,11 @@ def fetch_indices(bucket: int = 0) -> list[dict]:
     out = []
     for name, tk in specs:
         try:
-            t = yf.Ticker(tk)
-            val = prev = None
-            # intraday first so the strip actually moves during the session
-            try:
-                intr = t.history(period="1d", interval="1m")["Close"].dropna()
-                if not intr.empty:
-                    val = float(intr.iloc[-1])
-            except Exception:
-                pass
-            d = t.history(period="5d")["Close"].dropna()
-            if len(d) >= 1:
-                prev = float(d.iloc[-2]) if len(d) >= 2 else float(d.iloc[-1])
-                if val is None:
-                    val = float(d.iloc[-1])
-            if val is None or prev is None:
-                continue
-            out.append({"name": name, "value": val, "chg": (val / prev - 1) * 100})
+            h = yf.Ticker(tk).history(period="5d")["Close"].dropna()
+            if len(h) >= 2:
+                val = float(h.iloc[-1])
+                chg = (val / float(h.iloc[-2]) - 1) * 100
+                out.append({"name": name, "value": val, "chg": chg})
         except Exception:
             continue
     return out
@@ -925,19 +843,9 @@ def scan(tickers: tuple[str, ...], threshold: float, fetch_fund_limit: int) -> p
         chunk = list(tickers[i:i + batch])
         data = yf.download(chunk, period="1y", interval="1d", group_by="ticker",
                            auto_adjust=False, threads=True, progress=False)
-        _multi = isinstance(data.columns, pd.MultiIndex)
         for sym in chunk:
             try:
-                if _multi:
-                    _lvl0 = data.columns.get_level_values(0)
-                    if sym in _lvl0:
-                        df = data[sym]
-                    elif sym in data.columns.get_level_values(-1):
-                        df = data.xs(sym, axis=1, level=-1)
-                    else:
-                        continue
-                else:
-                    df = data
+                df = data[sym] if len(chunk) > 1 else data
                 c = df["Close"].dropna()
                 if c.empty:
                     continue
@@ -1002,6 +910,478 @@ def scan(tickers: tuple[str, ...], threshold: float, fetch_fund_limit: int) -> p
         r["Sec PE"] = sec_avg.get(r["Sector"])
     bar.empty()
     return pd.DataFrame(rows, columns=HEADERS + ["_SMA20", "_SMA50", "_SMA200"])
+
+
+# =========================== screening engine =============================
+# Architecture (two-stage funnel):
+#   stage 1  bulk_ohlcv()  one batched 1y OHLCV download for the whole universe
+#            -> tech_row() computes every technical value locally (free, fast)
+#   stage 2  fund_row()    one .info call per SURVIVING symbol, capped, cached
+#            6h -- the expensive half only runs on stocks that already passed
+#            the technical filters.
+# Both stages feed the same flat row dict, so one filter engine
+# (apply_num_filters) serves the custom screener, and tech_row alone serves
+# the ETF tab. Mutual funds have no OHLCV, so they use their own AMFI +
+# mfapi.in pair with the same table/export helpers.
+
+CUSTOM_FUND_CAP = 120
+
+# (column, label, group T=technical F=fundamental, decimals)
+NUM_COLS = [
+    ("Price", "Price (Rs)", "T", 2),
+    ("Chg1D", "1 day %", "T", 2),
+    ("Chg1W", "1 week %", "T", 2),
+    ("Chg1M", "1 month %", "T", 2),
+    ("Chg3M", "3 month %", "T", 2),
+    ("Chg6M", "6 month %", "T", 2),
+    ("Chg1Y", "1 year %", "T", 2),
+    ("RSI", "RSI (14)", "T", 1),
+    ("SMA20", "20 DMA", "T", 2),
+    ("SMA50", "50 DMA", "T", 2),
+    ("SMA200", "200 DMA", "T", 2),
+    ("Vs200", "Price vs 200 DMA %", "T", 2),
+    ("VWAP20", "VWAP (20d)", "T", 2),
+    ("VsVWAP", "Price vs VWAP %", "T", 2),
+    ("High52", "52 week high", "T", 2),
+    ("Low52", "52 week low", "T", 2),
+    ("FromHigh", "Below 52w high %", "T", 2),
+    ("FromLow", "Above 52w low %", "T", 2),
+    ("Volume", "Volume", "T", 0),
+    ("AvgVol20", "Avg volume (20d)", "T", 0),
+    ("VolX", "Volume vs avg (x)", "T", 2),
+    ("ATRpct", "ATR 14 %", "T", 2),
+    ("MCapCr", "Market cap (Rs cr)", "F", 0),
+    ("PE", "P/E", "F", 2),
+    ("FwdPE", "Forward P/E", "F", 2),
+    ("PB", "P/B", "F", 2),
+    ("ROE", "ROE %", "F", 2),
+    ("ROA", "ROA %", "F", 2),
+    ("DE", "Debt / equity", "F", 2),
+    ("DivYld", "Dividend yield %", "F", 2),
+    ("EPS", "EPS (Rs)", "F", 2),
+    ("RevGrowth", "Revenue growth %", "F", 2),
+    ("ProfitGrowth", "Earnings growth %", "F", 2),
+    ("OpMargin", "Operating margin %", "F", 2),
+    ("NetMargin", "Net margin %", "F", 2),
+    ("CurrRatio", "Current ratio", "F", 2),
+    ("Beta", "Beta", "F", 2),
+    ("Target", "1Y target (Rs)", "F", 2),
+    ("Upside", "Upside to target %", "F", 2),
+]
+COL_META = {c: (lab, grp, dp) for c, lab, grp, dp in NUM_COLS}
+FUND_KEYS = {c for c, _l, g, _d in NUM_COLS if g == "F"}
+
+PRESETS = {
+    "Oversold quality": [("RSI", "at most", 35, None), ("ROE", "at least", 12, None),
+                         ("DE", "at most", 1.0, None)],
+    "Momentum breakout": [("RSI", "at least", 60, None), ("Vs200", "at least", 5, None),
+                          ("FromHigh", "at most", 8, None), ("VolX", "at least", 1.2, None)],
+    "Value screen": [("PE", "between", 0, 18), ("PB", "at most", 3,  None),
+                     ("DivYld", "at least", 1, None)],
+    "Quality compounder": [("ROE", "at least", 18, None), ("DE", "at most", 0.5, None),
+                           ("ProfitGrowth", "at least", 10, None),
+                           ("OpMargin", "at least", 15, None)],
+    "Beaten down": [("FromHigh", "at least", 30, None), ("RSI", "at most", 45, None)],
+}
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def bulk_ohlcv(tickers: tuple[str, ...]) -> dict:
+    """One batched 1-year daily OHLCV download for a whole universe."""
+    out: dict = {}
+    batch, n = 200, len(tickers)
+    bar = st.progress(0.0, text="Downloading price history...")
+    for i in range(0, n, batch):
+        chunk = list(tickers[i:i + batch])
+        try:
+            data = yf.download(chunk, period="1y", interval="1d", group_by="ticker",
+                               auto_adjust=False, threads=True, progress=False)
+        except Exception:
+            data = None
+        if data is not None and not getattr(data, "empty", True):
+            for sym in chunk:
+                try:
+                    df = data[sym] if len(chunk) > 1 else data
+                    c = df["Close"].dropna()
+                    if len(c) < 30:
+                        continue
+                    out[sym] = {
+                        "close": c,
+                        "high": df["High"].dropna() if "High" in df else None,
+                        "low": df["Low"].dropna() if "Low" in df else None,
+                        "vol": df["Volume"].dropna() if "Volume" in df else None,
+                    }
+                except Exception:
+                    continue
+        bar.progress(min((i + batch) / n, 1.0),
+                     text=f"Priced {min(i + batch, n)}/{n} securities")
+    bar.empty()
+    return out
+
+
+def _numv(v, dp=2):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f in (float("inf"), float("-inf")):
+        return None
+    return round(f, dp)
+
+
+def _chg_pct(c: pd.Series, sessions: int):
+    if c is None or len(c) <= sessions:
+        return None
+    base = float(c.iloc[-1 - sessions])
+    return _numv((float(c.iloc[-1]) / base - 1) * 100) if base else None
+
+
+def _atr_pct(h, l, c, n: int = 14):
+    if h is None or l is None or c is None or len(c) < n + 1:
+        return None
+    try:
+        df = pd.DataFrame({"h": h, "l": l, "c": c}).dropna()
+        pc = df["c"].shift(1)
+        tr = pd.concat([df["h"] - df["l"], (df["h"] - pc).abs(),
+                        (df["l"] - pc).abs()], axis=1).max(axis=1)
+        atr = float(tr.rolling(n).mean().iloc[-1])
+        last = float(df["c"].iloc[-1])
+        return _numv(atr / last * 100) if last else None
+    except Exception:
+        return None
+
+
+def tech_row(symbol: str, d: dict) -> dict:
+    """Every technical value we can derive from one OHLCV history."""
+    c, v, h, l = d.get("close"), d.get("vol"), d.get("high"), d.get("low")
+    price = float(c.iloc[-1])
+    yr = c.tail(252)
+    hi = float(h.tail(252).max()) if h is not None and not h.empty else float(yr.max())
+    lo = float(l.tail(252).min()) if l is not None and not l.empty else float(yr.min())
+
+    def sma(n):
+        return _numv(c.rolling(n).mean().iloc[-1]) if len(c) >= n else None
+
+    s200, vw = sma(200), compute_vwap(c, v)
+    avg20 = _numv(v.rolling(20).mean().iloc[-1], 0) if v is not None and len(v) >= 20 else None
+    last_vol = _numv(v.iloc[-1], 0) if v is not None and not v.empty else None
+    return {
+        "Symbol": symbol.replace(".NS", ""),
+        "Price": _numv(price), "RSI": _numv(compute_rsi(c), 1),
+        "Chg1D": _chg_pct(c, 1), "Chg1W": _chg_pct(c, 5), "Chg1M": _chg_pct(c, 21),
+        "Chg3M": _chg_pct(c, 63), "Chg6M": _chg_pct(c, 126), "Chg1Y": _chg_pct(c, 248),
+        "SMA20": sma(20), "SMA50": sma(50), "SMA200": s200,
+        "Vs200": _numv((price / s200 - 1) * 100) if s200 else None,
+        "VWAP20": _numv(vw), "VsVWAP": _numv((price / vw - 1) * 100) if vw else None,
+        "High52": _numv(hi), "Low52": _numv(lo),
+        "FromHigh": _numv((1 - price / hi) * 100) if hi else None,
+        "FromLow": _numv((price / lo - 1) * 100) if lo else None,
+        "Volume": last_vol, "AvgVol20": avg20,
+        "VolX": _numv(last_vol / avg20) if (last_vol and avg20) else None,
+        "ATRpct": _atr_pct(h, l, c),
+    }
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fund_row(symbol: str) -> dict:
+    """Fundamentals for one symbol. Every value is reported as published --
+    missing figures stay None and are shown as 'n/a', never guessed."""
+    out = {k: None for k in FUND_KEYS}
+    out.update({"Sector": "n/a", "Industry": "n/a", "Buy/Sell": "n/a"})
+    try:
+        info = yf.Ticker(symbol).info or {}
+    except Exception:
+        return out
+    if not info:
+        return out
+
+    def pct(key):
+        v = info.get(key)
+        return _numv(float(v) * 100) if isinstance(v, (int, float)) else None
+
+    mcap = info.get("marketCap")
+    out["MCapCr"] = _numv(float(mcap) / 1e7, 0) if mcap else None
+    out["PE"], out["FwdPE"] = _numv(info.get("trailingPE")), _numv(info.get("forwardPE"))
+    out["PB"] = _numv(info.get("priceToBook"))
+    out["ROE"], out["ROA"] = pct("returnOnEquity"), pct("returnOnAssets")
+    de = info.get("debtToEquity")
+    out["DE"] = _numv(float(de) / 100) if isinstance(de, (int, float)) else None
+    dy = info.get("dividendYield")
+    if isinstance(dy, (int, float)):
+        out["DivYld"] = _numv(float(dy) * 100) if float(dy) < 1 else _numv(dy)
+    out["EPS"] = _numv(info.get("trailingEps"))
+    out["RevGrowth"] = pct("revenueGrowth")
+    out["ProfitGrowth"] = pct("earningsGrowth") or pct("earningsQuarterlyGrowth")
+    out["OpMargin"], out["NetMargin"] = pct("operatingMargins"), pct("profitMargins")
+    out["CurrRatio"], out["Beta"] = _numv(info.get("currentRatio")), _numv(info.get("beta"))
+    tp, price = info.get("targetMeanPrice"), info.get("currentPrice")
+    out["Target"] = _numv(tp)
+    if tp and price:
+        out["Upside"] = _numv((float(tp) / float(price) - 1) * 100)
+    if info.get("sector"):
+        out["Sector"] = str(info["sector"]).strip()
+    if info.get("industry"):
+        out["Industry"] = str(info["industry"]).strip()
+    rk = info.get("recommendationKey")
+    if rk and str(rk).lower() != "none":
+        out["Buy/Sell"] = str(rk).replace("_", " ").title()
+    return out
+
+
+def apply_num_filters(df: pd.DataFrame, filters: list[dict]) -> pd.DataFrame:
+    for f in filters:
+        col = f["col"]
+        if col not in df.columns:
+            continue
+        s = pd.to_numeric(df[col], errors="coerce")
+        if f["op"] == "at least":
+            df = df[s >= f["v1"]]
+        elif f["op"] == "at most":
+            df = df[s <= f["v1"]]
+        else:
+            lo, hi = sorted([f["v1"], f["v2"]])
+            df = df[(s >= lo) & (s <= hi)]
+    return df
+
+
+def custom_screen(tickers: tuple[str, ...], filters: list[dict],
+                  sectors: list[str], cap: int = CUSTOM_FUND_CAP) -> tuple[pd.DataFrame, int, bool]:
+    """Run the funnel. Returns (dataframe, universe size priced, fundamentals loaded)."""
+    data = bulk_ohlcv(tuple(tickers))
+    if not data:
+        return pd.DataFrame(), 0, False
+    df = pd.DataFrame([tech_row(s, d) for s, d in data.items()])
+    priced = len(df)
+    df = apply_num_filters(df, [f for f in filters if COL_META[f["col"]][1] == "T"])
+    need_fund = bool(sectors) or any(COL_META[f["col"]][1] == "F" for f in filters)
+    if not need_fund or df.empty:
+        return df.reset_index(drop=True), priced, False
+
+    df = df.head(cap).copy()
+    bar = st.progress(0.0, text=f"Loading fundamentals for {len(df)} matches")
+    frows = []
+    for i, sym in enumerate(df["Symbol"].tolist()):
+        frows.append(fund_row(f"{sym}.NS"))
+        time.sleep(0.25)
+        bar.progress((i + 1) / len(df), text=f"Fundamentals {i + 1}/{len(df)}")
+    bar.empty()
+    fdf = pd.DataFrame(frows, index=df.index)
+    df = pd.concat([df, fdf], axis=1)
+    if sectors:
+        df = df[df["Sector"].astype(str).isin(sectors)]
+    df = apply_num_filters(df, [f for f in filters if COL_META[f["col"]][1] == "F"])
+    return df.reset_index(drop=True), priced, True
+
+
+# ------------------------------- mutual funds ------------------------------
+
+_AMFI_NAV_URL = "https://www.amfiindia.com/spages/NAVAll.txt"
+
+
+def _mf_type(category: str) -> str:
+    c = (category or "").lower()
+    for key, label in (("equity", "Equity"), ("debt", "Debt"), ("hybrid", "Hybrid"),
+                       ("solution", "Solution oriented"), ("index", "Index / ETF"),
+                       ("other", "Other")):
+        if key in c:
+            return label
+    return "Other"
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_mutual_funds() -> pd.DataFrame:
+    """Every scheme AMFI publishes, with its latest declared NAV. Public file,
+    no auth, refreshed once every business evening."""
+    try:
+        r = requests.get(_AMFI_NAV_URL, timeout=25,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        text = r.text
+    except Exception:
+        return pd.DataFrame()
+    rows, amc, cat = [], "", ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if ";" not in line:
+            if "Schemes(" in line or "Scheme(" in line:
+                inner = line[line.find("(") + 1:line.rfind(")")] if "(" in line else line
+                cat = inner.strip() or line
+            else:
+                amc = line.replace("Mutual Fund", "").strip() or line
+            continue
+        parts = [p.strip() for p in line.split(";")]
+        if len(parts) < 6 or not parts[0].isdigit():
+            continue
+        try:
+            nav = float(parts[4])
+        except (ValueError, IndexError):
+            continue
+        rows.append({"Code": parts[0], "Scheme": parts[3], "AMC": amc,
+                     "Category": cat, "Type": _mf_type(cat), "NAV": round(nav, 4),
+                     "Date": parts[5]})
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def mf_returns(code: str) -> dict:
+    """Point-to-point returns from the scheme's own published NAV history
+    (mfapi.in mirrors AMFI). >1y figures are annualised (CAGR)."""
+    out = {k: None for k in ("1M", "3M", "6M", "1Y", "3Y", "5Y")}
+    try:
+        j = requests.get(f"https://api.mfapi.in/mf/{code}", timeout=10).json()
+        data = j.get("data") or []
+        pairs = {}
+        for x in data:
+            try:
+                pairs[pd.to_datetime(x["date"], format="%d-%m-%Y")] = float(x["nav"])
+            except (ValueError, TypeError, KeyError):
+                continue
+        if len(pairs) < 2:
+            return out
+        ser = pd.Series(pairs).sort_index()
+    except Exception:
+        return out
+    last, last_dt = float(ser.iloc[-1]), ser.index[-1]
+    for label, days in (("1M", 30), ("3M", 91), ("6M", 182), ("1Y", 365),
+                        ("3Y", 1095), ("5Y", 1825)):
+        past = ser[ser.index <= last_dt - pd.Timedelta(days=days)]
+        if past.empty:
+            continue
+        base = float(past.iloc[-1])
+        if base <= 0:
+            continue
+        yrs = days / 365.0
+        out[label] = (_numv((last / base - 1) * 100) if yrs <= 1.05
+                      else _numv(((last / base) ** (1 / yrs) - 1) * 100))
+    return out
+
+
+# ----------------------------------- etfs ----------------------------------
+# Symbol, display name, category. Symbols that return no history are dropped
+# at render time, so the list can carry newer launches safely.
+ETF_LIST = [
+    ("NIFTYBEES", "Nippon Nifty 50", "Broad market"),
+    ("SETFNIF50", "SBI Nifty 50", "Broad market"),
+    ("UTINIFTETF", "UTI Nifty 50", "Broad market"),
+    ("NIFTYIETF", "ICICI Nifty 50", "Broad market"),
+    ("HDFCNIFTY", "HDFC Nifty 50", "Broad market"),
+    ("JUNIORBEES", "Nippon Nifty Next 50", "Broad market"),
+    ("ICICIB22", "BHARAT 22", "Broad market"),
+    ("EQUAL50ADD", "Nifty 50 Equal Weight", "Broad market"),
+    ("MID150BEES", "Nippon Nifty Midcap 150", "Mid & small cap"),
+    ("MIDCAPETF", "ICICI Nifty Midcap 150", "Mid & small cap"),
+    ("MOM100", "Motilal Midcap 100", "Mid & small cap"),
+    ("HDFCSML250", "HDFC Nifty Smallcap 250", "Mid & small cap"),
+    ("MOSMALL250", "Motilal Smallcap 250", "Mid & small cap"),
+    ("BANKBEES", "Nippon Nifty Bank", "Sector & theme"),
+    ("SETFNIFBK", "SBI Nifty Bank", "Sector & theme"),
+    ("BANKIETF", "ICICI Nifty Bank", "Sector & theme"),
+    ("PSUBNKBEES", "Nippon PSU Bank", "Sector & theme"),
+    ("ITBEES", "Nippon Nifty IT", "Sector & theme"),
+    ("ITIETF", "ICICI Nifty IT", "Sector & theme"),
+    ("PHARMABEES", "Nippon Nifty Pharma", "Sector & theme"),
+    ("AUTOBEES", "Nippon Nifty Auto", "Sector & theme"),
+    ("CONSUMBEES", "Nippon Nifty India Consumption", "Sector & theme"),
+    ("INFRABEES", "Nippon Nifty Infrastructure", "Sector & theme"),
+    ("FMCGIETF", "ICICI Nifty FMCG", "Sector & theme"),
+    ("METALIETF", "ICICI Nifty Metal", "Sector & theme"),
+    ("HEALTHIETF", "ICICI Nifty Healthcare", "Sector & theme"),
+    ("PVTBANIETF", "ICICI Nifty Private Bank", "Sector & theme"),
+    ("MAKEINDIA", "Nippon Nifty India Manufacturing", "Sector & theme"),
+    ("MOMOMENTUM", "Motilal Nifty 200 Momentum 30", "Factor"),
+    ("ALPHA", "Nippon Nifty Alpha 50", "Factor"),
+    ("ALPL30IETF", "ICICI Alpha Low Vol 30", "Factor"),
+    ("MOVALUE", "Motilal Nifty 500 Value 50", "Factor"),
+    ("LOWVOLIETF", "ICICI Nifty Low Vol 30", "Factor"),
+    ("MOQUALITY", "Motilal Nifty 200 Quality 30", "Factor"),
+    ("GOLDBEES", "Nippon Gold", "Gold & silver"),
+    ("SETFGOLD", "SBI Gold", "Gold & silver"),
+    ("HDFCGOLD", "HDFC Gold", "Gold & silver"),
+    ("AXISGOLD", "Axis Gold", "Gold & silver"),
+    ("GOLDIETF", "ICICI Gold", "Gold & silver"),
+    ("SILVERBEES", "Nippon Silver", "Gold & silver"),
+    ("SILVERIETF", "ICICI Silver", "Gold & silver"),
+    ("HDFCSILVER", "HDFC Silver", "Gold & silver"),
+    ("MON100", "Motilal Nasdaq 100", "International"),
+    ("MAFANG", "Mirae NYSE FANG+", "International"),
+    ("MASPTOP50", "Mirae S&P 500 Top 50", "International"),
+    ("HNGSNGBEES", "Nippon Hang Seng", "International"),
+    ("LIQUIDBEES", "Nippon Liquid", "Debt & liquid"),
+    ("GILT5YBEES", "Nippon Nifty 5Y G-Sec", "Debt & liquid"),
+    ("LTGILTBEES", "Nippon Long Term Gilt", "Debt & liquid"),
+    ("EBBETF0433", "Bharat Bond 2033", "Debt & liquid"),
+]
+ETF_META = {s: (n, c) for s, n, c in ETF_LIST}
+ETF_CATEGORIES = list(dict.fromkeys(c for _s, _n, c in ETF_LIST))
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def scan_etfs() -> pd.DataFrame:
+    data = bulk_ohlcv(tuple(f"{s}.NS" for s, _n, _c in ETF_LIST))
+    rows = []
+    for sym, d in data.items():
+        r = tech_row(sym, d)
+        name, cat = ETF_META.get(r["Symbol"], ("", "Other"))
+        r["Name"], r["Category"] = name, cat
+        rows.append(r)
+    df = pd.DataFrame(rows)
+    return df.sort_values("Symbol").reset_index(drop=True) if not df.empty else df
+
+
+# ------------------------- shared table + export ---------------------------
+
+def fmt_val(v, dp=2, pct=False):
+    if v is None or (isinstance(v, float) and v != v):
+        return "n/a"
+    if isinstance(v, (int, float)):
+        s = f"{v:,.{dp}f}"
+        return f"{s}%" if pct else s
+    return _html.escape(str(v))
+
+
+def sh_table(headers: list[tuple[str, str]], rows: list[str]) -> str:
+    head = "".join(f'<th class="th-{a}">{_html.escape(h)}</th>' for h, a in headers)
+    return ('<div class="sh-tablewrap"><table class="sh-table"><thead><tr>'
+            + head + "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>")
+
+
+def signed_cell(v, dp=2, suffix="%"):
+    if not isinstance(v, (int, float)):
+        return '<td class="c-num c-muted">n/a</td>'
+    clr = "#0B7A4B" if v >= 0 else "#B3261E"
+    return (f'<td class="c-num" style="color:{clr};font-weight:600">'
+            f'{v:+,.{dp}f}{suffix}</td>')
+
+
+def df_to_excel_bytes(df: pd.DataFrame, sheet: str, labels: dict | None = None) -> bytes:
+    labels = labels or {}
+    wb = Workbook()
+    ws = wb.active
+    ws.title = sheet[:31]
+    cols = [c for c in df.columns if not c.startswith("_")]
+    ws.append([labels.get(c, c) for c in cols])
+    for cell in ws[1]:
+        cell.fill = PatternFill("solid", fgColor="111C2B")
+        cell.font = Font(name="Arial", bold=True, color="FFFFFF", size=11)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    for _, r in df.iterrows():
+        ws.append([(None if (isinstance(r[c], float) and r[c] != r[c]) else r[c])
+                   for c in cols])
+        for cell in ws[ws.max_row]:
+            cell.font = Font(name="Arial", size=11)
+            if isinstance(cell.value, float):
+                cell.number_format = "#,##0.00"
+    for i, c in enumerate(cols, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = \
+            max(11, min(38, len(str(labels.get(c, c))) + 4))
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(cols))}{max(ws.max_row, 2)}"
+    ws.cell(row=ws.max_row + 2, column=1, value="Disclaimer: " + DISCLAIMER).font = \
+        Font(name="Arial", italic=True, size=9)
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
 # --------------------------------- excel ----------------------------------
@@ -1313,11 +1693,10 @@ st.markdown(
     'stroke-linecap="round" stroke-linejoin="round"/>'
     '<path d="M20 8 H28 V16" stroke="url(#smg)" stroke-width="3.4" '
     'stroke-linecap="round" stroke-linejoin="round"/></svg></span>'
-    '<span style="letter-spacing:-0.02em"><span style="color:#5CA8FF">Stock</span>'
-    '<span style="color:#FFFFFF;font-family:Georgia,serif;font-style:italic;'
-    'font-weight:600;padding:0 1px">Mer</span>'
-    '<span style="color:#5CA8FF">it</span></span></div>'
-    '<div class="band-sub">Stock it. Analyze it.</div></div>'
+    '<span style="letter-spacing:-0.02em"><span style="color:#FFFFFF">Stock</span>'
+    '<span style="color:#5CA8FF">Mer</span>'
+    '<span style="color:#FFFFFF">it</span></span></div>'
+    '<div class="band-sub">Analyze at one place …</div></div>'
     f'<div class="band-date">{dt.date.today().strftime("%d-%m-%Y")}</div></div>',
     unsafe_allow_html=True)
 
@@ -1364,12 +1743,15 @@ live_on = True
 live_every = 1
 
 # --- top nav: Screener / Stock OI / News ---
-_view_map = {"screener": "Screener", "oi": "Stock OI", "news": "News"}
+_view_map = {"screener": "Screener", "custom": "Custom Screen",
+             "mf": "Mutual Funds", "etf": "ETFs",
+             "oi": "Stock OI", "news": "News"}
 _qp_view = str(st.query_params.get("view", "")).lower()
 if _qp_view in _view_map and "view" not in st.session_state:
     st.session_state["view"] = _view_map[_qp_view]
 st.session_state.setdefault("view", "Screener")
-view = st.radio("view", ["Screener", "Stock OI", "News"],
+view = st.radio("view", ["Screener", "Custom Screen", "Mutual Funds", "ETFs",
+                         "Stock OI", "News"],
                 horizontal=True, label_visibility="collapsed", key="view")
 
 # --- hyperlink handler: ?stock=SYMBOL opens the detail dialog in any view ---
@@ -1399,12 +1781,9 @@ if view == "Stock OI":
     _now_ist = (dt.datetime.utcnow() + dt.timedelta(hours=5, minutes=30)).strftime("%d %b %Y, %H:%M IST")
     if _oi_src == "dhan":
         _cap = f"Live prices &amp; OI via Dhan API - {_now_ist}. "
-    elif _oi_src == "nse":
-        _cap = (f"Live prices &amp; OI via NSE public feed - {_now_ist}. "
-                "May be delayed or briefly unavailable. ")
     elif _oi_src == "yf":
         _cap = (f"Live prices via public market feed - {_now_ist}. "
-                "Open interest feed is temporarily unavailable (shown as -). ")
+                "OI needs a Dhan token in app secrets (shown as - until then). ")
     else:
         _cap = "Live market feed is unreachable right now - no data shown. "
     st.caption(_cap + "Rise in OI with rise in price = long buildup.")
@@ -1434,6 +1813,320 @@ if view == "Stock OI":
         + "</tbody></table></div>", unsafe_allow_html=True)
     st.stop()
 
+SIGNED_COLS = {"Chg1D", "Chg1W", "Chg1M", "Chg3M", "Chg6M", "Chg1Y", "Vs200",
+               "VsVWAP", "Upside", "RevGrowth", "ProfitGrowth"}
+PCT_COLS = {"FromHigh", "FromLow", "ROE", "ROA", "DivYld", "OpMargin",
+            "NetMargin", "ATRpct"}
+
+
+def metric_cell(col: str, v) -> str:
+    dp = COL_META.get(col, (col, "T", 2))[2]
+    if col in SIGNED_COLS:
+        return signed_cell(v, dp)
+    if col == "RSI":
+        return (f'<td class="c-num c-rsi" style="color:{rsi_color(v)}">'
+                f'{fmt_val(v, 1)}</td>')
+    if col == "Buy/Sell":
+        return (f'<td class="c-reco"><span class="pill" title="{reco_info(v)}" '
+                f'style="background:{reco_color(v)}">{_html.escape(str(v))}</span></td>')
+    if col == "Sector":
+        return (f'<td class="c-sec" style="color:{sector_color(v)}">'
+                f'{_html.escape(str(v))}</td>')
+    return f'<td class="c-num{" c-muted" if col in ("Volume", "AvgVol20") else ""}">' \
+           f'{fmt_val(v, dp, pct=col in PCT_COLS)}</td>'
+
+
+# ============================ Custom Screen view ===========================
+if view == "Custom Screen":
+    st.markdown("### Custom screen")
+    st.caption("Build your own filter set from every technical and fundamental "
+               "value the app holds. Conditions combine with AND. Technicals run "
+               f"across the whole list; fundamentals then load for up to "
+               f"{CUSTOM_FUND_CAP} technical matches.")
+
+    st.session_state.setdefault("cs_filters", [])
+    st.session_state.setdefault("cs_universe", "NIFTY 50")
+
+    st.markdown('<div class="sec-label">Stocks to scan</div>', unsafe_allow_html=True)
+    _urow = st.columns([2, 2, 2, 1, 1], gap="small")
+    for _c, _n in zip(_urow[:3], UNIVERSES):
+        if _c.button(_n, use_container_width=True, key=f"cs_u_{_n}",
+                     type="primary" if st.session_state["cs_universe"] == _n else "secondary"):
+            st.session_state["cs_universe"] = _n
+            st.rerun()
+    _cs_run = _urow[3].button("Run screen", type="primary", key="cs_run",
+                             use_container_width=True)
+    _cs_reset = _urow[4].button("Reset", key="cs_reset", use_container_width=True)
+    if _cs_reset:
+        for _k in ("cs_filters", "cs_results", "cs_sectors", "cs_fund"):
+            st.session_state.pop(_k, None)
+        st.rerun()
+
+    st.markdown('<div class="sec-label" style="margin-top:12px">Add a condition</div>',
+                unsafe_allow_html=True)
+    _opts = [f"{'Technical' if g == 'T' else 'Fundamental'} · {lab}"
+             for _c2, lab, g, _d in NUM_COLS]
+    _by_label = {f"{'Technical' if g == 'T' else 'Fundamental'} · {lab}": col
+                 for col, lab, g, _d in NUM_COLS}
+    _b = st.columns([3, 1.6, 1.3, 1.3, 1.4], gap="small")
+    _m = _b[0].selectbox("Value", _opts, key="cs_metric", label_visibility="collapsed")
+    _op = _b[1].selectbox("Condition", ["at least", "at most", "between"],
+                          key="cs_op", label_visibility="collapsed")
+    _v1 = _b[2].number_input("min", value=None, key="cs_v1",
+                             label_visibility="collapsed", placeholder="value")
+    _v2 = _b[3].number_input("max", value=None, key="cs_v2",
+                             label_visibility="collapsed", placeholder="upper",
+                             disabled=_op != "between")
+    if _b[4].button("Add", use_container_width=True, key="cs_add"):
+        if _v1 is None or (_op == "between" and _v2 is None):
+            st.warning("Enter a value for the condition.")
+        else:
+            st.session_state["cs_filters"].append(
+                {"col": _by_label[_m], "op": _op, "v1": float(_v1),
+                 "v2": float(_v2) if _v2 is not None else None})
+            st.rerun()
+
+    _pc = st.columns([3, 3, 1.4], gap="small")
+    _preset = _pc[0].selectbox("Preset", ["Start from a preset..."] + list(PRESETS),
+                              key="cs_preset", label_visibility="collapsed")
+    _sectors = _pc[1].multiselect(
+        "Sectors", sorted({"Financial Services", "Technology", "Healthcare",
+                           "Consumer Cyclical", "Consumer Defensive", "Industrials",
+                           "Basic Materials", "Energy", "Utilities",
+                           "Communication Services", "Real Estate"}),
+        key="cs_sectors", placeholder="Any sector", label_visibility="collapsed")
+    if _pc[2].button("Apply preset", use_container_width=True, key="cs_apply_preset"):
+        if _preset in PRESETS:
+            st.session_state["cs_filters"] = [
+                {"col": c, "op": o, "v1": float(a), "v2": float(b) if b is not None else None}
+                for c, o, a, b in PRESETS[_preset]]
+            st.rerun()
+
+    if st.session_state["cs_filters"]:
+        st.markdown('<div class="sec-label" style="margin-top:10px">Active conditions</div>',
+                    unsafe_allow_html=True)
+        for _i, _f in enumerate(list(st.session_state["cs_filters"])):
+            _lab, _grp, _dp = COL_META[_f["col"]]
+            _txt = (f"{_lab} between {_f['v1']:g} and {_f['v2']:g}"
+                    if _f["op"] == "between" else f"{_lab} {_f['op']} {_f['v1']:g}")
+            _fr = st.columns([6, 1], gap="small")
+            _fr[0].markdown(
+                f'<div style="padding:6px 0;font-size:0.9rem">'
+                f'<span class="pill" style="background:'
+                f'{"#0E7C86" if _grp == "T" else "#6B5BC7"}">'
+                f'{"TECH" if _grp == "T" else "FUND"}</span>&nbsp; {_html.escape(_txt)}</div>',
+                unsafe_allow_html=True)
+            if _fr[1].button("Remove", key=f"cs_rm_{_i}", use_container_width=True):
+                st.session_state["cs_filters"].pop(_i)
+                st.rerun()
+    else:
+        st.caption("No conditions yet — a screen with none returns the whole list, "
+                   "ranked by whichever column you sort on.")
+
+    if _cs_run:
+        _tks = tickers_for(st.session_state["cs_universe"])
+        if not _tks:
+            st.error(f"The {st.session_state['cs_universe']} list did not load. "
+                     "Try again in a minute.")
+        else:
+            _df, _priced, _hasf = custom_screen(
+                tuple(_tks), st.session_state["cs_filters"], _sectors)
+            st.session_state["cs_results"] = _df
+            st.session_state["cs_priced"] = _priced
+            st.session_state["cs_fund"] = _hasf
+
+    _res = st.session_state.get("cs_results")
+    if _res is None:
+        st.info("Add conditions (or apply a preset), pick a list, then run the screen.")
+    elif _res.empty:
+        st.warning("No stock matches every condition. Loosen one and run again.")
+    else:
+        _hasf = st.session_state.get("cs_fund", False)
+        _cols = ["Symbol"] + (["Sector"] if _hasf else []) + ["Price", "Chg1D", "RSI"]
+        for _f in st.session_state["cs_filters"]:
+            if _f["col"] not in _cols:
+                _cols.append(_f["col"])
+        if _hasf and "Buy/Sell" not in _cols:
+            _cols.append("Buy/Sell")
+        _cols = [c for c in _cols[:13] if c in _res.columns]
+
+        _sortable = [c for c in _cols if c not in ("Symbol", "Sector", "Buy/Sell")]
+        _sc = st.columns([2, 1.4, 2.6, 1.6], gap="small")
+        _sort = _sc[0].selectbox("Sort by", _sortable,
+                                 format_func=lambda c: COL_META[c][0])
+        _dir = _sc[1].selectbox("Order", ["High to low", "Low to high"], key="cs_dir")
+        _view_df = _res.sort_values(_sort, ascending=_dir == "Low to high",
+                                    na_position="last")
+        _sc[2].markdown(f"**{len(_res)} matches** from "
+                        f"{st.session_state.get('cs_priced', 0)} priced securities.")
+        _sc[3].download_button(
+            "⤓  Download", key="cs_dl",
+            data=df_to_excel_bytes(_view_df, "Custom screen",
+                                   {c: COL_META[c][0] for c in COL_META}),
+            file_name=f"Custom_Screen_{dt.date.today().isoformat()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True)
+
+        _heads = [("Symbol", "l")] + [
+            (COL_META[c][0] if c in COL_META else c,
+             "l" if c in ("Sector",) else "c" if c == "Buy/Sell" else "r")
+            for c in _cols[1:]]
+        _rows = []
+        for _, _r2 in _view_df.iterrows():
+            _cells = [f'<td><a class="c-sym" href="?view=custom&stock={_r2["Symbol"]}" '
+                      f'target="_self">{_html.escape(str(_r2["Symbol"]))}</a></td>']
+            _cells += [metric_cell(c, _r2.get(c)) for c in _cols[1:]]
+            _rows.append("<tr>" + "".join(_cells) + "</tr>")
+        st.markdown('<div class="sh-hint">Click a symbol for the full detail view. '
+                    "Columns follow your conditions.</div>", unsafe_allow_html=True)
+        st.markdown(sh_table(_heads, _rows), unsafe_allow_html=True)
+        if not _hasf:
+            st.caption("Fundamental values load only when a fundamental condition or "
+                       "a sector filter is part of the screen.")
+
+    st.markdown(f'<div class="disc"><strong>Disclaimer</strong> — {DISCLAIMER}</div>',
+                unsafe_allow_html=True)
+    st.stop()
+
+# ============================= Mutual Funds view ===========================
+if view == "Mutual Funds":
+    st.markdown("### Mutual funds")
+    _mf = load_mutual_funds()
+    if _mf.empty:
+        st.error("AMFI's NAV file is unreachable right now. Nothing is shown rather "
+                 "than stale values — try again in a few minutes.")
+        st.stop()
+    st.caption(f"{len(_mf):,} schemes from AMFI's official daily NAV file "
+               f"(latest published {_mf['Date'].iloc[0]}). Returns come from each "
+               "scheme's own NAV history; over 1 year they are annualised.")
+
+    _f1 = st.columns([1.6, 2.2, 2.6, 2], gap="small")
+    _type = _f1[0].selectbox("Type", ["All types"] + sorted(_mf["Type"].unique()),
+                             key="mf_type")
+    _pool = _mf if _type == "All types" else _mf[_mf["Type"] == _type]
+    _amc = _f1[1].selectbox("Fund house", ["All fund houses"] + sorted(_pool["AMC"].unique()))
+    if _amc != "All fund houses":
+        _pool = _pool[_pool["AMC"] == _amc]
+    _cat = _f1[2].selectbox("Category", ["All categories"] + sorted(_pool["Category"].unique()))
+    if _cat != "All categories":
+        _pool = _pool[_pool["Category"] == _cat]
+    _q = _f1[3].text_input("Search scheme", key="mf_q", placeholder="e.g. flexi cap")
+    if _q and _q.strip():
+        _pool = _pool[_pool["Scheme"].str.contains(_q.strip(), case=False, na=False)]
+
+    _o1 = st.columns([1.4, 1.4, 2.6, 1.6], gap="small")
+    _plan = _o1[0].selectbox("Plan", ["Any plan", "Direct only", "Regular only"],
+                             key="mf_plan")
+    if _plan == "Direct only":
+        _pool = _pool[_pool["Scheme"].str.contains("direct", case=False, na=False)]
+    elif _plan == "Regular only":
+        _pool = _pool[~_pool["Scheme"].str.contains("direct", case=False, na=False)]
+    _growth = _o1[1].selectbox("Option", ["Any option", "Growth only"], key="mf_opt")
+    if _growth == "Growth only":
+        _pool = _pool[_pool["Scheme"].str.contains("growth", case=False, na=False)]
+    _pool = _pool.reset_index(drop=True)
+    _shown = _pool.head(300)
+    _o1[2].markdown(f"**{len(_pool):,} schemes** match" +
+                    (f" — showing the first {len(_shown)}." if len(_pool) > 300 else "."))
+    _o1[3].download_button(
+        "⤓  Download", key="mf_dl",
+        data=df_to_excel_bytes(_pool.drop(columns=["Code"]), "Mutual funds"),
+        file_name=f"Mutual_Funds_{dt.date.today().isoformat()}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True)
+
+    st.session_state.setdefault("mf_ret", {})
+    _rc = st.columns([2, 4], gap="small")
+    _n_ret = min(len(_shown), 25)
+    if _rc[0].button(f"Load returns for top {_n_ret}", key="mf_load_ret",
+                     use_container_width=True, disabled=_n_ret == 0):
+        _bar = st.progress(0.0, text="Reading NAV histories...")
+        for _i, _code in enumerate(_shown["Code"].head(_n_ret).tolist()):
+            st.session_state["mf_ret"][_code] = mf_returns(_code)
+            _bar.progress((_i + 1) / _n_ret, text=f"Loaded {_i + 1}/{_n_ret}")
+        _bar.empty()
+    _rc[1].caption("Returns are fetched per scheme, so they load on demand for the "
+                   "visible top of the list.")
+
+    _mf_heads = [("Scheme", "l"), ("Fund house", "l"), ("Category", "l"),
+                 ("NAV (Rs)", "r"), ("1Y %", "r"), ("3Y %", "r"), ("5Y %", "r"),
+                 ("NAV date", "l")]
+    _mf_rows = []
+    for _, _s in _shown.iterrows():
+        _ret = st.session_state["mf_ret"].get(_s["Code"], {})
+        _mf_rows.append(
+            "<tr>"
+            f'<td style="white-space:normal;max-width:420px;font-weight:500">'
+            f'{_html.escape(str(_s["Scheme"]))}</td>'
+            f'<td class="c-sec" style="color:{sector_color(_s["AMC"])}">'
+            f'{_html.escape(str(_s["AMC"]))}</td>'
+            f'<td class="c-muted" style="white-space:normal;max-width:260px">'
+            f'{_html.escape(str(_s["Category"]))}</td>'
+            f'<td class="c-num">{fmt_val(_s["NAV"], 4)}</td>'
+            + signed_cell(_ret.get("1Y")) + signed_cell(_ret.get("3Y"))
+            + signed_cell(_ret.get("5Y"))
+            + f'<td class="c-date">{_html.escape(str(_s["Date"]))}</td>'
+            "</tr>")
+    st.markdown(sh_table(_mf_heads, _mf_rows), unsafe_allow_html=True)
+    st.markdown(f'<div class="disc"><strong>Disclaimer</strong> — {DISCLAIMER}</div>',
+                unsafe_allow_html=True)
+    st.stop()
+
+# ================================ ETFs view ================================
+if view == "ETFs":
+    st.markdown("### ETFs")
+    _etf = scan_etfs()
+    if _etf.empty:
+        st.error("The market feed is unreachable right now — no ETF data shown.")
+        st.stop()
+    st.caption(f"{len(_etf)} NSE-listed ETFs with live technicals on the same engine "
+               "as the stock screener. Click a symbol for its price levels.")
+
+    _e1 = st.columns([2, 2, 2.4, 1.6], gap="small")
+    _ecat = _e1[0].selectbox("Category", ["All categories"] + ETF_CATEGORIES, key="etf_cat")
+    _pool = _etf if _ecat == "All categories" else _etf[_etf["Category"] == _ecat]
+    _eq = _e1[1].text_input("Search", key="etf_q", placeholder="e.g. gold",
+                            label_visibility="visible")
+    if _eq and _eq.strip():
+        _m = _eq.strip()
+        _pool = _pool[_pool["Symbol"].str.contains(_m, case=False, na=False)
+                      | _pool["Name"].str.contains(_m, case=False, na=False)]
+    _esort = _e1[2].selectbox(
+        "Sort by", ["Chg1D", "Chg1M", "Chg1Y", "RSI", "Volume", "Price", "Vs200"],
+        format_func=lambda c: COL_META[c][0], key="etf_sort")
+    _pool = _pool.sort_values(_esort, ascending=False, na_position="last")
+    _e1[3].download_button(
+        "⤓  Download", key="etf_dl",
+        data=df_to_excel_bytes(
+            _pool[["Symbol", "Name", "Category", "Price", "Chg1D", "Chg1M", "Chg1Y",
+                   "RSI", "Vs200", "High52", "Low52", "Volume", "AvgVol20"]],
+            "ETFs", {c: COL_META[c][0] for c in COL_META}),
+        file_name=f"ETFs_{dt.date.today().isoformat()}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True)
+
+    _e_cols = ["Price", "Chg1D", "Chg1W", "Chg1M", "Chg1Y", "RSI", "Vs200",
+               "High52", "Low52", "Volume"]
+    _e_heads = [("Symbol", "l"), ("ETF", "l"), ("Category", "l")] + \
+               [(COL_META[c][0], "r") for c in _e_cols]
+    _e_rows = []
+    for _, _r3 in _pool.iterrows():
+        _e_rows.append(
+            "<tr>"
+            f'<td><a class="c-sym" href="?view=etf&stock={_r3["Symbol"]}" '
+            f'target="_self">{_html.escape(str(_r3["Symbol"]))}</a></td>'
+            f'<td style="font-weight:500">{_html.escape(str(_r3["Name"]))}</td>'
+            f'<td class="c-sec" style="color:{sector_color(_r3["Category"])}">'
+            f'{_html.escape(str(_r3["Category"]))}</td>'
+            + "".join(metric_cell(c, _r3.get(c)) for c in _e_cols)
+            + "</tr>")
+    st.markdown(sh_table(_e_heads, _e_rows), unsafe_allow_html=True)
+    st.caption("Gold, silver and international ETFs track their own underlying, so "
+               "RSI and moving averages describe the ETF price, not an index.")
+    st.markdown(f'<div class="disc"><strong>Disclaimer</strong> — {DISCLAIMER}</div>',
+                unsafe_allow_html=True)
+    st.stop()
+
 # --- Screener view ---
 _live_active = live_on and market_open()
 
@@ -1452,8 +2145,7 @@ def render_indices_strip():
                 unsafe_allow_html=True)
     _ts = dt.datetime.now(IST).strftime("%H:%M:%S")
     if _live_active:
-        st.caption(f"🟢 Live (may be delayed ~15 min) · updated {_ts} IST · "
-                   f"refreshing every {max(int(live_every), 5)}s")
+        st.caption(f"🟢 Live · updated {_ts} IST · refreshing every {int(live_every)}s")
     elif live_on:
         st.caption(f"⚪ Market closed · showing last close ({_ts} IST)")
     else:
@@ -1534,53 +2226,12 @@ elif results.empty:
     st.warning(f"Nothing is at RSI {st.session_state.get('threshold', threshold)} or "
                "above right now. Lower the threshold or widen the stock list.")
 else:
-    # --- filters: Buy/Sell + Sector + Filter button. State lives in the URL
-    # (like the scan config) so opening a stock detail keeps the filtered view
-    # intact and never re-scans. ---
-    _bs_vals = sorted(v for v in results["Buy/Sell"].astype(str).unique()
-                      if v not in ("n/a", "not loaded", "None", ""))
-    _sec_vals = sorted(v for v in results["Sector"].astype(str).unique()
-                       if v not in ("n/a", "not loaded", "None", ""))
-    _bs_opts = ["All"] + _bs_vals
-    _sec_opts = ["All"] + _sec_vals
-
-    _cur_bs = str(st.query_params.get("bs", "All"))
-    _cur_sec = str(st.query_params.get("sec", "All"))
-    if _cur_bs not in _bs_opts:
-        _cur_bs = "All"
-    if _cur_sec not in _sec_opts:
-        _cur_sec = "All"
-
-    _fc1, _fc2, _fc3, _fc4 = st.columns([2, 2, 1, 1], gap="small")
-    _bs_sel = _fc1.selectbox("Buy/Sell", _bs_opts,
-                             index=_bs_opts.index(_cur_bs), key="flt_bs")
-    _sec_sel = _fc2.selectbox("Sector", _sec_opts,
-                              index=_sec_opts.index(_cur_sec), key="flt_sec")
-    _fc3.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-    _apply = _fc3.button("Filter", type="primary", use_container_width=True)
-    _fc4.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-    _clearf = _fc4.button("Reset", use_container_width=True)
-
-    if _apply:
-        if _bs_sel == "All":
-            st.query_params.pop("bs", None)
-        else:
-            st.query_params["bs"] = _bs_sel
-        if _sec_sel == "All":
-            st.query_params.pop("sec", None)
-        else:
-            st.query_params["sec"] = _sec_sel
-        st.rerun()
-    if _clearf:
-        st.query_params.pop("bs", None)
-        st.query_params.pop("sec", None)
-        st.rerun()
-
-    # apply the URL-backed filters (source of truth, survives the detail reload)
-    if _cur_bs != "All":
-        results = results[results["Buy/Sell"].astype(str) == _cur_bs]
-    if _cur_sec != "All":
-        results = results[results["Sector"].astype(str) == _cur_sec]
+    _all_bs = [b for b in ["Buy", "Sell", "Hold", "Neutral"]
+               if b in set(results["Buy/Sell"].astype(str))]
+    _fc1, _fc2 = st.columns([1, 3], gap="small")
+    _bs_choice = _fc1.selectbox("Buy/Sell filter", ["All"] + _all_bs, index=0)
+    if _bs_choice != "All":
+        results = results[results["Buy/Sell"].astype(str) == _bs_choice]
     hleft, hright = st.columns([4, 1], gap="small")
     hleft.markdown(f"**{len(results)} stocks** at RSI "
                    f"{st.session_state.get('threshold', threshold)} or above, "
@@ -1598,19 +2249,13 @@ else:
         f'<th class="th-{a}">{COL_LABELS.get(h, h)}</th>' for h, a in zip(HEADERS, aligns))
 
     _cfgq = quote(st.query_params.get("scan", ""), safe="")
-    _fq = ""
-    if _cur_bs != "All":
-        _fq += f"&bs={quote(_cur_bs, safe='')}"
-    if _cur_sec != "All":
-        _fq += f"&sec={quote(_cur_sec, safe='')}"
     body_rows = []
     for _, r in results.iterrows():
         sym = r["Stock Symbol"]
         rsi = r["RSI"]
         reco = r["Buy/Sell"]
         rsi_txt = f"{rsi:.1f}" if isinstance(rsi, (int, float)) else str(rsi)
-        href = (f"?scan={_cfgq}{_fq}&stock={sym}" if _cfgq
-                else f"?{_fq[1:]}&stock={sym}" if _fq else f"?stock={sym}")
+        href = f"?scan={_cfgq}&stock={sym}" if _cfgq else f"?stock={sym}"
         _sv = lambda v: f"{v:,.2f}" if isinstance(v, (int, float)) else "n/a"
         _vol = lambda v: f"{int(v):,}" if isinstance(v, (int, float)) else "n/a"
         sma_tip = (f"20-day SMA: {_sv(r.get('_SMA20'))}  |  "
