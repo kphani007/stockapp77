@@ -265,23 +265,26 @@ h1,h2,h3,h4,h5 { font-family:'Archivo', sans-serif; letter-spacing:-0.02em; }
 .band{
   position:sticky; top:0; z-index:1000;
   background:linear-gradient(100deg,#111C2B 0%,#123A44 55%,#0E7C86 100%);
-  border-radius:12px; padding:8px 18px; margin-bottom:12px;
+  border-radius:12px; padding:7px 16px; margin-bottom:8px;
   display:flex; align-items:center; justify-content:space-between;
-  flex-wrap:wrap; gap:10px; box-shadow:0 10px 28px -16px rgba(17,28,43,0.6);
+  flex-wrap:nowrap; gap:14px; box-shadow:0 8px 22px -16px rgba(17,28,43,0.6);
 }
+.band-left{ display:flex; align-items:baseline; gap:14px; min-width:0; flex-wrap:wrap; }
 .band-name{ font-family:'Archivo',sans-serif; font-weight:700; font-size:1.15rem;
   color:#FFF; letter-spacing:-0.03em; line-height:1.1; display:flex; align-items:center; gap:8px; }
 .band-name .brandmark{ width:22px; height:22px; border-radius:6px; background:#FFF;
   display:inline-flex; align-items:center; justify-content:center; }
 .band-name .m{ color:#5CA8FF; }
-.band-sub{ font-family:'IBM Plex Mono',monospace; font-size:0.78rem;
-  color:#B6D8DC; margin-top:6px; }
+.band-sub{ font-family:'IBM Plex Mono',monospace; font-size:0.74rem;
+  color:#B6D8DC; margin:0; white-space:nowrap; }
 .idxcard{ background:#FFF; border:1px solid #DDE6ED; border-radius:10px; padding:8px 11px; }
 .idx-n{ font-size:0.66rem; text-transform:uppercase; letter-spacing:0.06em; color:#5E6E7E; font-weight:600; }
 .idx-v{ font-family:'IBM Plex Mono',monospace; font-size:0.9rem; font-weight:600; margin-top:3px; }
 .idx-c{ font-family:'IBM Plex Mono',monospace; font-size:0.74rem; font-weight:600; margin-top:2px; }
-.band-date{ font-family:'IBM Plex Mono',monospace; font-size:0.78rem; color:#EAF6F7;
-  background:rgba(255,255,255,0.14); border-radius:999px; padding:6px 14px; }
+.band-date{ font-family:'IBM Plex Mono',monospace; font-size:0.72rem; color:#EAF6F7;
+  background:rgba(255,255,255,0.14); border-radius:999px; padding:4px 12px;
+  white-space:nowrap; }
+.hdr-search div[data-baseweb="select"] > div{ min-height:38px; }
 
 .sec-label{ font-size:0.72rem; text-transform:uppercase; letter-spacing:0.09em;
   color:var(--muted); font-weight:600; margin:2px 0 6px; }
@@ -1784,8 +1787,8 @@ def _valid_symbol(sym: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9&.\-]{1,20}", sym or ""))
 
 
-st.markdown(
-    '<div class="band"><div><div class="band-name">'
+_BAND_HTML = (
+    '<div class="band"><div class="band-left"><div class="band-name">'
     '<span class="brandmark"><svg width="22" height="22" viewBox="0 0 32 32" fill="none">'
     '<defs><linearGradient id="smg" x1="2" y1="26" x2="30" y2="6" gradientUnits="userSpaceOnUse">'
     '<stop stop-color="#1B4DB8"/><stop offset="1" stop-color="#3E9BFF"/></linearGradient></defs>'
@@ -1797,8 +1800,8 @@ st.markdown(
     '<span style="color:#5CA8FF">Mer</span>'
     '<span style="color:#FFFFFF">it</span></span></div>'
     '<div class="band-sub">Analyze it. Stock it.</div></div>'
-    f'<div class="band-date">{dt.date.today().strftime("%d-%m-%Y")}</div></div>',
-    unsafe_allow_html=True)
+    f'<div class="band-date">{dt.date.today().strftime("%d-%m-%Y")}</div></div>')
+
 
 def _open_in_screener(sym: str) -> None:
     """Show a searched stock as a one-row screener result. The user then clicks
@@ -1818,25 +1821,32 @@ def _open_in_screener(sym: str) -> None:
     st.rerun()
 
 
-# --- global stock search (moved out of the sidebar, sits under the header) ---
-_sp, _sbox = st.columns([2, 1], gap="large")
-with _sbox:
-    _all_syms = load_all_nse_tickers()
-    if _all_syms:
-        _opts = [s.replace(".NS", "") for s in _all_syms]
-        _picked = st.selectbox(" ", _opts, index=None,
-                               placeholder="🔍  Search any stock…",
-                               label_visibility="collapsed")
-        if _picked and st.session_state.get("last_search") != _picked:
-            st.session_state["last_search"] = _picked
-            _open_in_screener(_picked)
-    else:
-        _typed = st.text_input(" ", placeholder="🔍  Search any stock…",
-                               label_visibility="collapsed")
-        _tv = _typed.strip().upper()
-        if _tv and _valid_symbol(_tv) and st.session_state.get("last_search") != _tv:
-            st.session_state["last_search"] = _tv
-            _open_in_screener(_tv)
+# --- header row: compact banner, with the stock search beside it on the tabs
+# where a stock lookup makes sense (mutual funds and ETFs have their own search)
+_SEARCH_TABS = {"Screener", "Custom Screen", "Stock OI", "News"}
+if view in _SEARCH_TABS:
+    _hb, _sbox = st.columns([3, 1], gap="medium")
+    _hb.markdown(_BAND_HTML, unsafe_allow_html=True)
+    _sbox.markdown('<div class="hdr-search"></div>', unsafe_allow_html=True)
+    with _sbox:
+        _all_syms = tickers_for("All NIFTY Stocks")
+        if _all_syms:
+            _opts = [s.replace(".NS", "") for s in _all_syms]
+            _picked = st.selectbox(" ", _opts, index=None,
+                                   placeholder="🔍  Search any stock…",
+                                   label_visibility="collapsed")
+            if _picked and st.session_state.get("last_search") != _picked:
+                st.session_state["last_search"] = _picked
+                _open_in_screener(_picked)
+        else:
+            _typed = st.text_input(" ", placeholder="🔍  Search any stock…",
+                                   label_visibility="collapsed")
+            _tv = _typed.strip().upper()
+            if _tv and _valid_symbol(_tv) and st.session_state.get("last_search") != _tv:
+                st.session_state["last_search"] = _tv
+                _open_in_screener(_tv)
+else:
+    st.markdown(_BAND_HTML, unsafe_allow_html=True)
 
 # --- live-tick settings (kept in code; no sidebar UI) ---
 live_on = True
@@ -1851,8 +1861,8 @@ if _qp_view in _view_map and "view" not in st.session_state:
     st.session_state["view"] = _view_map[_qp_view]
 st.session_state.setdefault("view", "Screener")
 st.sidebar.markdown('<div class="nav-h">Sections</div>', unsafe_allow_html=True)
-view = st.sidebar.radio("view", ["Screener", "Custom Screen", "Mutual Funds", "ETFs",
-                                "Stock OI", "News"],
+view = st.sidebar.radio("view", ["Screener", "Stock OI", "Custom Screen", "ETFs",
+                                "Mutual Funds", "News"],
                         label_visibility="collapsed", key="view")
 st.sidebar.markdown('<div class="nav-foot">Collapse this panel with the arrow above. '
                     'Data is reference only — not investment advice.</div>',
@@ -1950,6 +1960,8 @@ if view == "Custom Screen":
 
     st.session_state.setdefault("cs_filters", [])
     st.session_state.setdefault("cs_universe", "NIFTY 50")
+    st.session_state.setdefault("cs_nonce", 0)
+    _nonce = st.session_state["cs_nonce"]
 
     st.markdown('<div class="sec-label">Stocks to scan</div>', unsafe_allow_html=True)
     _urow = st.columns([2, 2, 2, 1, 1], gap="small")
@@ -1957,17 +1969,21 @@ if view == "Custom Screen":
         if _c.button(_n, use_container_width=True, key=f"cs_u_{_n}",
                      type="primary" if st.session_state["cs_universe"] == _n else "secondary"):
             st.session_state["cs_universe"] = _n
-            for _k in ("cs_sectors", "cs_results", "cs_fund", "cs_sort", "cs_dir"):
+            for _k in ("cs_results", "cs_fund"):
                 st.session_state.pop(_k, None)
+            st.session_state[f"csw_sectors_{_nonce}"] = []
             st.rerun()
     _cs_run = _urow[3].button("Run screen", type="primary", key="cs_run",
                              use_container_width=True)
     _cs_reset = _urow[4].button("Reset", key="cs_reset", use_container_width=True)
     if _cs_reset:
-        for _k in ("cs_filters", "cs_results", "cs_priced", "cs_fund", "cs_sectors",
-                   "cs_metric", "cs_op", "cs_v1", "cs_v2", "cs_preset", "cs_dir",
-                   "cs_sort", "cs_universe"):
+        for _k in [k for k in list(st.session_state)
+                   if k.startswith(("cs_", "csw_"))]:
             st.session_state.pop(_k, None)
+        # bump the widget nonce so every control below mounts as a NEW widget --
+        # popping a key alone is not enough, Streamlit replays the old value from
+        # the browser onto a widget that keeps the same key and position
+        st.session_state["cs_nonce"] = _nonce + 1
         st.rerun()
 
     st.markdown('<div class="sec-label" style="margin-top:12px">Add a condition</div>',
@@ -1977,11 +1993,13 @@ if view == "Custom Screen":
     _by_label = {f"{'Technical' if g == 'T' else 'Fundamental'} · {lab}": col
                  for col, lab, g, _d in NUM_COLS}
     _b = st.columns([3, 1.6, 1.3, 1.3, 1.4], gap="small")
-    _m = _b[0].selectbox("Value", _opts, key="cs_metric")
-    _op = _b[1].selectbox("Condition", ["at least", "at most", "between"], key="cs_op")
-    _v1 = _b[2].number_input("Value", value=None, key="cs_v1", placeholder="number")
-    _v2 = _b[3].number_input("Upper", value=None, key="cs_v2", placeholder="number",
-                             disabled=_op != "between")
+    _m = _b[0].selectbox("Value", _opts, key=f"csw_metric_{_nonce}")
+    _op = _b[1].selectbox("Condition", ["at least", "at most", "between"],
+                          key=f"csw_op_{_nonce}")
+    _v1 = _b[2].number_input("Value", value=None, key=f"csw_v1_{_nonce}",
+                             placeholder="number")
+    _v2 = _b[3].number_input("Upper", value=None, key=f"csw_v2_{_nonce}",
+                             placeholder="number", disabled=_op != "between")
     _b[4].markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
     if _b[4].button("Add", use_container_width=True, key="cs_add"):
         if _v1 is None or (_op == "between" and _v2 is None):
@@ -1994,13 +2012,13 @@ if view == "Custom Screen":
 
     _pc = st.columns([3, 3, 1.4], gap="small")
     _preset = _pc[0].selectbox("Preset", ["Start from a preset..."] + list(PRESETS),
-                              key="cs_preset")
+                              key=f"csw_preset_{_nonce}")
     _sectors = _pc[1].multiselect(
         "Sector", sorted({"Financial Services", "Technology", "Healthcare",
                           "Consumer Cyclical", "Consumer Defensive", "Industrials",
                           "Basic Materials", "Energy", "Utilities",
                           "Communication Services", "Real Estate"}),
-        key="cs_sectors", placeholder="All sectors")
+        key=f"csw_sectors_{_nonce}", placeholder="All sectors")
     _pc[2].markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
     if _pc[2].button("Apply preset", use_container_width=True, key="cs_apply_preset"):
         if _preset in PRESETS:
@@ -2060,8 +2078,10 @@ if view == "Custom Screen":
         _sortable = [c for c in _cols if c not in ("Symbol", "Sector", "Buy/Sell")]
         _sc = st.columns([2, 2, 2.4, 1.6], gap="small")
         _sort = _sc[0].selectbox("Sort by", _sortable,
-                                 format_func=lambda c: COL_META[c][0])
-        _dir = _sc[1].selectbox("Order", ["High to low", "Low to high"], key="cs_dir")
+                                 format_func=lambda c: COL_META[c][0],
+                                 key=f"csw_sort_{_nonce}")
+        _dir = _sc[1].selectbox("Order", ["High to low", "Low to high"],
+                                key=f"csw_dir_{_nonce}")
         _view_df = _res.sort_values(_sort, ascending=_dir == "Low to high",
                                     na_position="last")
         _sc[2].markdown(f"**{len(_res)} matches** from "
