@@ -1293,7 +1293,9 @@ def mf_returns(code: str) -> dict:
     (mfapi.in mirrors AMFI). >1y figures are annualised (CAGR)."""
     out = {k: None for k in ("1M", "3M", "6M", "1Y", "3Y", "5Y")}
     try:
-        j = requests.get(f"https://api.mfapi.in/mf/{code}", timeout=10).json()
+        j = requests.get(f"https://api.mfapi.in/mf/{code}", timeout=12,
+                         headers={"User-Agent": "Mozilla/5.0",
+                                  "Accept": "application/json"}).json()
         data = j.get("data") or []
         pairs = {}
         for x in data:
@@ -1444,16 +1446,50 @@ def etf_inav(symbols: tuple[str, ...], bucket: int = 0) -> dict:
     return out
 
 
+@st.cache_data(ttl=21600, show_spinner=False)
+def etf_amfi_nav() -> dict:
+    """Last declared NAV for our ETFs from AMFI's own daily file, matched on
+    scheme name. Used only when the live iNAV feed is unreachable. A symbol whose
+    name matches nothing is left out rather than guessed at."""
+    mf = load_mutual_funds()
+    if mf.empty:
+        return {}
+    pool = mf[mf["Scheme"].str.contains("etf|bees|exchange traded", case=False,
+                                       na=False, regex=True)]
+    if pool.empty:
+        return {}
+    norm = pool["Scheme"].str.lower().str.replace(r"[^a-z0-9 ]", " ", regex=True)
+    out: dict = {}
+    for sym, name, _cat in ETF_LIST:
+        toks = [t for t in re.split(r"[^a-z0-9]+", name.lower()) if t]
+        if not toks:
+            continue
+        hit = norm
+        for t in toks:
+            hit = hit[hit.str.contains(rf"\b{re.escape(t)}\b", regex=True, na=False)]
+            if hit.empty:
+                break
+        if hit.empty:
+            continue
+        # several schemes carry the same words (Nifty 50 vs Nifty 50 Value 20);
+        # the shortest name is the plain fund, the longer ones are its variants
+        row = pool.loc[hit.str.len().idxmin()]
+        out[sym] = {"nav": float(row["NAV"]), "scheme": str(row["Scheme"]),
+                    "date": str(row["Date"])}
+    return out
+
+
 @st.cache_data(ttl=60, show_spinner=False)
-def scan_etfs(price_bucket: int = 0, nav_bucket: int = 0) -> tuple[pd.DataFrame, bool]:
-    """ETF technicals, live price and iNAV. Returns (rows, iNAV came from the
-    live NSE board)."""
+def scan_etfs(price_bucket: int = 0, nav_bucket: int = 0) -> tuple[pd.DataFrame, str]:
+    """ETF technicals, live price and iNAV. Returns (rows, which NAV source the
+    table is actually showing)."""
     data = bulk_ohlcv(tuple(f"{s}.NS" for s, _n, _c in ETF_LIST), price_bucket)
     live = fetch_nse_etf_live(price_bucket)
     missing = tuple(s for s in data
                     if not (live.get(s.replace(".NS", "").upper()) or {}).get("inav"))
     navs = etf_inav(missing, nav_bucket)
-    rows = []
+    amfi = etf_amfi_nav() if any(v is None for v in navs.values()) else {}
+    rows, srcs = [], set()
     for sym, d in data.items():
         r = tech_row(sym, d)
         name, cat = ETF_META.get(r["Symbol"], ("", "Other"))
@@ -1463,14 +1499,30 @@ def scan_etfs(price_bucket: int = 0, nav_bucket: int = 0) -> tuple[pd.DataFrame,
             r["Price"] = _numv(lv["ltp"])
         if lv.get("chg") is not None:
             r["Chg1D"] = _numv(lv["chg"])
-        r["iNAV"] = lv.get("inav") or navs.get(r["Symbol"])
+        _am = amfi.get(r["Symbol"]) or {}
+        if lv.get("inav"):
+            r["iNAV"] = _numv(lv["inav"])
+            r["_NavSrc"] = "Live iNAV from the NSE ETF board"
+            srcs.add("nse")
+        elif navs.get(r["Symbol"]) is not None:
+            r["iNAV"] = navs[r["Symbol"]]
+            r["_NavSrc"] = "NAV from the fund quote feed"
+            srcs.add("yf")
+        elif _am:
+            r["iNAV"] = _numv(_am["nav"])
+            r["_NavSrc"] = f"Last declared NAV {_am['date']} (AMFI) - {_am['scheme']}"
+            srcs.add("amfi")
+        else:
+            r["iNAV"], r["_NavSrc"] = None, "No NAV published for this fund"
         r["PremDisc"] = (_numv((r["Price"] / r["iNAV"] - 1) * 100)
                          if r["iNAV"] and r["Price"] else None)
         rows.append(r)
     df = pd.DataFrame(rows)
+    src = ("nse" if "nse" in srcs else "yf" if "yf" in srcs
+           else "amfi" if "amfi" in srcs else "none")
     if df.empty:
-        return df, bool(live)
-    return df.sort_values("Symbol").reset_index(drop=True), bool(live)
+        return df, src
+    return df.sort_values("Symbol").reset_index(drop=True), src
 
 
 # ------------------------- shared table + export ---------------------------
@@ -2008,8 +2060,8 @@ if view == "Custom Screen":
     _nonce = st.session_state["cs_nonce"]
 
     st.markdown('<div class="sec-label">Stocks to scan</div>', unsafe_allow_html=True)
-    _urow = st.columns([2, 2, 2, 1, 1], gap="small")
-    for _c, _n in zip(_urow[:3], UNIVERSES):
+    _urow = st.columns(3, gap="small")
+    for _c, _n in zip(_urow, UNIVERSES):
         if _c.button(_n, use_container_width=True, key=f"cs_u_{_n}",
                      type="primary" if st.session_state["cs_universe"] == _n else "secondary"):
             st.session_state["cs_universe"] = _n
@@ -2017,18 +2069,6 @@ if view == "Custom Screen":
                 st.session_state.pop(_k, None)
             st.session_state[f"csw_sectors_{_nonce}"] = []
             st.rerun()
-    _cs_run = _urow[3].button("Run screen", type="primary", key="cs_run",
-                             use_container_width=True)
-    _cs_reset = _urow[4].button("Reset", key="cs_reset", use_container_width=True)
-    if _cs_reset:
-        for _k in [k for k in list(st.session_state)
-                   if k.startswith(("cs_", "csw_"))]:
-            st.session_state.pop(_k, None)
-        # bump the widget nonce so every control below mounts as a NEW widget --
-        # popping a key alone is not enough, Streamlit replays the old value from
-        # the browser onto a widget that keeps the same key and position
-        st.session_state["cs_nonce"] = _nonce + 1
-        st.rerun()
 
     st.markdown('<div class="sec-label" style="margin-top:12px">Add a condition</div>',
                 unsafe_allow_html=True)
@@ -2091,6 +2131,21 @@ if view == "Custom Screen":
     else:
         st.caption("No conditions yet — a screen with none returns the whole list, "
                    "ranked by whichever column you sort on.")
+
+    # the run controls sit below the conditions: they act on every condition
+    # above them, so they read as the last step rather than the first
+    _act = st.columns([2, 1.4, 4.6], gap="small")
+    _cs_run = _act[0].button("Run screen", type="primary", key="cs_run",
+                             use_container_width=True)
+    if _act[1].button("Reset", key="cs_reset", use_container_width=True):
+        for _k in [k for k in list(st.session_state)
+                   if k.startswith(("cs_", "csw_"))]:
+            st.session_state.pop(_k, None)
+        # bump the widget nonce so every control above mounts as a NEW widget --
+        # popping a key alone is not enough, Streamlit replays the old value from
+        # the browser onto a widget that keeps the same key and position
+        st.session_state["cs_nonce"] = _nonce + 1
+        st.rerun()
 
     if _cs_run:
         _tks = tickers_for(st.session_state["cs_universe"])
@@ -2213,17 +2268,32 @@ if view == "Mutual Funds":
         use_container_width=True)
 
     st.session_state.setdefault("mf_ret", {})
-    _rc = st.columns([2, 4], gap="small")
     _n_ret = min(len(_shown), 25)
-    if _rc[0].button(f"Load returns for top {_n_ret}", key="mf_load_ret",
-                     use_container_width=True, disabled=_n_ret == 0):
+    _codes = _shown["Code"].head(_n_ret).tolist()
+    _todo = [c for c in _codes if c not in st.session_state["mf_ret"]]
+    if _todo:
         _bar = st.progress(0.0, text="Reading NAV histories...")
-        for _i, _code in enumerate(_shown["Code"].head(_n_ret).tolist()):
+        for _i, _code in enumerate(_todo):
             st.session_state["mf_ret"][_code] = mf_returns(_code)
-            _bar.progress((_i + 1) / _n_ret, text=f"Loaded {_i + 1}/{_n_ret}")
+            _bar.progress((_i + 1) / len(_todo), text=f"Loaded {_i + 1}/{len(_todo)}")
         _bar.empty()
-    _rc[1].caption("Returns are fetched per scheme, so they load on demand for the "
-                   "visible top of the list.")
+    _got = sum(1 for c in _codes
+               if any(v is not None
+                      for v in (st.session_state["mf_ret"].get(c) or {}).values()))
+    if _codes and not _got:
+        st.warning("Return figures are unavailable right now — the NAV history "
+                   "service did not respond. NAVs below are AMFI's own and are "
+                   "current; returns show n/a rather than a stale number.")
+    _rc = st.columns([2, 4], gap="small")
+    if _rc[0].button(f"Reload returns for top {_n_ret}", key="mf_load_ret",
+                     use_container_width=True, disabled=_n_ret == 0):
+        for _c4 in _codes:
+            st.session_state["mf_ret"].pop(_c4, None)
+        mf_returns.clear()
+        st.rerun()
+    _rc[1].caption(f"Returns load automatically for the visible top {_n_ret} schemes "
+                   "— each one is a separate NAV history, so the rest stay blank "
+                   "until you narrow the filters.")
 
     _mf_heads = [("Scheme", "l"), ("Fund house", "l"), ("Category", "l"),
                  ("NAV (Rs)", "r"), ("1Y %", "r"), ("3Y %", "r"), ("5Y %", "r"),
@@ -2258,20 +2328,23 @@ if view == "ETFs":
     def render_etf_tab():
         # prices refresh on a 1-minute bucket, iNAVs on a 5-minute bucket, so
         # every figure on this tab tracks live trade while the market is open
-        _etf, _nse_live = scan_etfs(int(time.time() // 60) if _etf_live else 0,
-                                    int(time.time() // 300) if _etf_live else 0)
+        _etf, _navsrc = scan_etfs(int(time.time() // 60) if _etf_live else 0,
+                                  int(time.time() // 300) if _etf_live else 0)
         if _etf.empty:
             st.error("The market feed is unreachable right now — no ETF data shown.")
             return
         _ts = dt.datetime.now(IST).strftime("%H:%M:%S")
-        _src = ("prices and iNAV from the NSE ETF board" if _nse_live
-                else "prices live; iNAV from the fund quote feed")
+        _srcs = {"nse": "iNAV live from the NSE ETF board",
+                 "yf": "NAV from the fund quote feed",
+                 "amfi": "NAV is each fund's last declared AMFI figure — the live "
+                         "iNAV feed is not reachable from this host",
+                 "none": "no NAV source is reachable, so the iNAV column reads n/a"}
         st.caption(
-            (f"🟢 Live · {len(_etf)} NSE-listed ETFs · {_src}, updated {_ts} IST "
-             "and refreshing every minute."
+            (f"🟢 Live · {len(_etf)} NSE-listed ETFs · prices updated {_ts} IST, "
+             "refreshing every minute"
              if _etf_live else
-             f"⚪ Market closed · {len(_etf)} NSE-listed ETFs at last close ({_ts} IST).")
-            + " Click a symbol for its price levels.")
+             f"⚪ Market closed · {len(_etf)} NSE-listed ETFs at last close ({_ts} IST)")
+            + f" · {_srcs[_navsrc]}. Hover a NAV to see where it came from.")
 
         _e1 = st.columns([2, 2, 2.4, 1.6], gap="small")
         _ecat = _e1[0].selectbox("Category", ["All categories"] + ETF_CATEGORIES, key="etf_cat")
@@ -2312,7 +2385,12 @@ if view == "ETFs":
                 f'<td class="c-sec" style="color:{sector_color(_r3["Category"])}">'
                 f'{_html.escape(str(_r3["Category"]))}</td>'
                 + spark_cell(_r3.get("_Spark", ""), "Closing price, last 30 sessions")
-                + "".join(metric_cell(c, _r3.get(c)) for c in _e_cols)
+                + "".join(
+                    (f'<td class="c-num" title="'
+                     f'{_html.escape(str(_r3.get("_NavSrc", "")), quote=True)}">'
+                     f'{fmt_val(_r3.get("iNAV"), 2)}</td>')
+                    if c == "iNAV" else metric_cell(c, _r3.get(c))
+                    for c in _e_cols)
                 + "</tr>")
         st.markdown(sh_table(_e_heads, _e_rows), unsafe_allow_html=True)
         st.caption("iNAV is the fund's indicative net asset value per unit, refreshed "
@@ -2357,8 +2435,8 @@ st.markdown('<div class="sec-label">Stocks to scan</div>', unsafe_allow_html=Tru
 if "universe" not in st.session_state:
     st.session_state["universe"] = "NIFTY 50"
 st.session_state.setdefault("rsi_thr", 65)
-row = st.columns([2, 2, 2, 1, 1], gap="small")
-for col, name in zip(row[:3], UNIVERSES):
+row = st.columns(3, gap="small")
+for col, name in zip(row, UNIVERSES):
     if col.button(name, use_container_width=True,
                   type="primary" if st.session_state["universe"] == name else "secondary",
                   key=f"u_{name}"):
@@ -2367,8 +2445,6 @@ for col, name in zip(row[:3], UNIVERSES):
         st.rerun()
 universe_choice = st.session_state["universe"]
 uploaded = None
-run = row[3].button("Run", type="primary", use_container_width=True)
-clear = row[4].button("Clear", use_container_width=True)
 
 st.markdown('<div class="sec-label" style="margin-top:12px">Filters</div>',
             unsafe_allow_html=True)
@@ -2379,6 +2455,11 @@ threshold = fcol.slider(f"RSI at or above — {st.session_state['rsi_thr']}", 0,
 if universe_choice == "All NIFTY Stocks":
     st.caption("All NIFTY Stocks pulls ~2000 listed stocks and can take several "
                "minutes. NIFTY 500 is the better broad option for daily use.")
+
+# run controls sit under the filters they act on
+_arow = st.columns([2, 1.4, 4.6], gap="small")
+run = _arow[0].button("Run screen", type="primary", use_container_width=True)
+clear = _arow[1].button("Clear", use_container_width=True)
 
 if clear:
     for k in ("results", "scanned", "threshold", "opened_for", "screener_table",
