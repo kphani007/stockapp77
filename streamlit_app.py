@@ -69,14 +69,145 @@ OI_SYMBOLS = [
 DHAN_QUOTE_URL = "https://api.dhan.co/v2/marketfeed/quote"
 DHAN_HIST_URL = "https://api.dhan.co/v2/charts/historical"
 DHAN_SCRIP_URL = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
+DHAN_TOKEN_URL = "https://auth.dhan.co/app/generateAccessToken"
 
 
-def _dhan_creds() -> tuple[str, str]:
+# --------------------------- Dhan auth (dormant) ---------------------------
+# Nothing here runs until the secrets exist, so the app behaves exactly as it
+# does today until the Data API subscription is in place.
+#
+#   .streamlit/secrets.toml
+#   DHAN_CLIENT_ID    = "1100000000"    # your Dhan client id
+#   DHAN_ACCESS_TOKEN = "eyJ..."        # optional: a token pasted by hand (24h)
+#   DHAN_PIN          = "1234"          # for self-refreshing tokens (needs TOTP)
+#   DHAN_TOTP_SECRET  = "BASE32SECRET"  # the TOTP seed from Dhan's 2FA setup
+#
+# A hand-pasted token lasts 24 hours, which is no use to a deployed app, so
+# prefer PIN + TOTP: the app then mints its own token and re-mints it on expiry.
+
+def _secret(name: str) -> str:
     try:
-        return (str(st.secrets.get("DHAN_CLIENT_ID", "")).strip(),
-                str(st.secrets.get("DHAN_ACCESS_TOKEN", "")).strip())
+        return str(st.secrets.get(name, "")).strip()
     except Exception:
-        return "", ""
+        return ""
+
+
+@st.cache_data(ttl=43200, show_spinner=False)
+def _dhan_mint_token(client_id: str, pin: str, totp_secret: str, bucket: int = 0) -> str:
+    """Mint a fresh 24h access token from PIN + TOTP. Cached 12h and re-minted
+    when a call rejects the token, so the app never runs on a stale one."""
+    if not (client_id and pin and totp_secret):
+        return ""
+    try:
+        import pyotp
+        code = pyotp.TOTP(totp_secret.replace(" ", "")).now()
+        r = requests.post(DHAN_TOKEN_URL, timeout=12,
+                          params={"dhanClientId": client_id, "pin": pin, "totp": code},
+                          headers={"Accept": "application/json"})
+        return str((r.json() or {}).get("accessToken", "")).strip()
+    except Exception:
+        return ""
+
+
+def _dhan_creds(force_refresh: bool = False) -> tuple[str, str]:
+    """(client id, access token). A pasted token wins; otherwise the app mints
+    one itself. Returns ('', '') when Dhan is not configured -- every caller
+    already falls back to the public feeds in that case."""
+    cid = _secret("DHAN_CLIENT_ID")
+    tok = _secret("DHAN_ACCESS_TOKEN")
+    if cid and tok and not force_refresh:
+        return cid, tok
+    pin, seed = _secret("DHAN_PIN"), _secret("DHAN_TOTP_SECRET")
+    if not (cid and pin and seed):
+        return (cid, tok) if (cid and tok) else ("", "")
+    if force_refresh:
+        _dhan_mint_token.clear()
+    minted = _dhan_mint_token(cid, pin, seed, int(time.time() // 43200))
+    return (cid, minted) if minted else ("", "")
+
+
+def _dhan_headers(cid: str, tok: str) -> dict:
+    return {"access-token": tok, "client-id": cid,
+            "Content-Type": "application/json", "Accept": "application/json"}
+
+
+def dhan_configured() -> bool:
+    return bool(_dhan_creds()[1])
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _dhan_etf_secids(symbols: tuple[str, ...]) -> dict:
+    """Symbol -> NSE_EQ security id for our ETFs, from Dhan's scrip master."""
+    try:
+        df = pd.read_csv(DHAN_SCRIP_URL, low_memory=False)
+    except Exception:
+        return {}
+    cols = {c.lower().replace(" ", "_").replace("-", "_"): c for c in df.columns}
+    sid = cols.get("security_id") or cols.get("securityid")
+    sym = (cols.get("underlying_symbol") or cols.get("sm_symbol_name")
+           or cols.get("symbol_name") or cols.get("trading_symbol"))
+    seg = cols.get("exch_id") or cols.get("exchange_segment") or cols.get("segment")
+    if not (sid and sym):
+        return {}
+    d = df
+    if seg:
+        d = d[d[seg].astype(str).str.upper().str.contains("NSE", na=False)]
+    want = {s.upper() for s in symbols}
+    out: dict = {}
+    for _i, row in d.iterrows():
+        s = str(row[sym]).strip().upper()
+        if s in want and s not in out:
+            try:
+                out[s] = int(row[sid])
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def dhan_etf_quotes(symbols: tuple[str, ...], bucket: int = 0) -> dict:
+    """Live LTP, day change and iNAV per ETF from Dhan's market-feed quote call --
+    one request for the whole list. Empty dict when Dhan is not configured or the
+    call fails, and the caller falls back to the public sources."""
+    cid, tok = _dhan_creds()
+    if not (cid and tok) or not symbols:
+        return {}
+    secmap = _dhan_etf_secids(symbols)
+    if not secmap:
+        return {}
+    rev = {v: k for k, v in secmap.items()}
+
+    def _post(token: str):
+        return requests.post(DHAN_QUOTE_URL, timeout=10,
+                             headers=_dhan_headers(cid, token),
+                             json={"NSE_EQ": list(secmap.values())})
+
+    try:
+        r = _post(tok)
+        if r.status_code in (401, 403):          # token expired: mint one and retry
+            cid, tok = _dhan_creds(force_refresh=True)
+            if not tok:
+                return {}
+            r = _post(tok)
+        qmap = ((r.json() or {}).get("data") or {}).get("NSE_EQ") or {}
+    except Exception:
+        return {}
+    out: dict = {}
+    for k, qd in qmap.items():
+        try:
+            s = rev.get(int(k))
+        except (TypeError, ValueError):
+            s = None
+        if not s or not isinstance(qd, dict):
+            continue
+        prev = qd.get("prev_close_price") or qd.get("close_price")
+        ltp = qd.get("last_price", qd.get("ltp"))
+        chg = None
+        if isinstance(ltp, (int, float)) and isinstance(prev, (int, float)) and prev:
+            chg = (float(ltp) / float(prev) - 1) * 100
+        out[s] = {"ltp": ltp, "chg": chg,
+                  "inav": qd.get("inav") or qd.get("iNav") or qd.get("nav")}
+    return out
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -1484,23 +1615,30 @@ def scan_etfs(price_bucket: int = 0, nav_bucket: int = 0) -> tuple[pd.DataFrame,
     """ETF technicals, live price and iNAV. Returns (rows, which NAV source the
     table is actually showing)."""
     data = bulk_ohlcv(tuple(f"{s}.NS" for s, _n, _c in ETF_LIST), price_bucket)
-    live = fetch_nse_etf_live(price_bucket)
+    dhan = dhan_etf_quotes(tuple(s for s, _n, _c in ETF_LIST), price_bucket)
+    live = {} if dhan else fetch_nse_etf_live(price_bucket)
     missing = tuple(s for s in data
-                    if not (live.get(s.replace(".NS", "").upper()) or {}).get("inav"))
-    navs = etf_inav(missing, nav_bucket)
+                    if not (dhan.get(s.replace(".NS", "").upper()) or {}).get("inav")
+                    and not (live.get(s.replace(".NS", "").upper()) or {}).get("inav"))
+    navs = etf_inav(missing, nav_bucket) if missing else {}
     amfi = etf_amfi_nav() if any(v is None for v in navs.values()) else {}
     rows, srcs = [], set()
     for sym, d in data.items():
         r = tech_row(sym, d)
         name, cat = ETF_META.get(r["Symbol"], ("", "Other"))
         r["Name"], r["Category"] = name, cat
-        lv = live.get(r["Symbol"].upper()) or {}
+        _dh = dhan.get(r["Symbol"].upper()) or {}
+        lv = _dh or (live.get(r["Symbol"].upper()) or {})
         if lv.get("ltp"):
             r["Price"] = _numv(lv["ltp"])
         if lv.get("chg") is not None:
             r["Chg1D"] = _numv(lv["chg"])
         _am = amfi.get(r["Symbol"]) or {}
-        if lv.get("inav"):
+        if _dh.get("inav"):
+            r["iNAV"] = _numv(_dh["inav"])
+            r["_NavSrc"] = "Live intraday iNAV from the Dhan market feed"
+            srcs.add("dhan")
+        elif lv.get("inav"):
             r["iNAV"] = _numv(lv["inav"])
             r["_NavSrc"] = "Live iNAV from the NSE ETF board"
             srcs.add("nse")
@@ -1518,8 +1656,8 @@ def scan_etfs(price_bucket: int = 0, nav_bucket: int = 0) -> tuple[pd.DataFrame,
                          if r["iNAV"] and r["Price"] else None)
         rows.append(r)
     df = pd.DataFrame(rows)
-    src = ("nse" if "nse" in srcs else "yf" if "yf" in srcs
-           else "amfi" if "amfi" in srcs else "none")
+    src = ("dhan" if "dhan" in srcs else "nse" if "nse" in srcs
+           else "yf" if "yf" in srcs else "amfi" if "amfi" in srcs else "none")
     if df.empty:
         return df, src
     return df.sort_values("Symbol").reset_index(drop=True), src
@@ -2334,7 +2472,8 @@ if view == "ETFs":
             st.error("The market feed is unreachable right now — no ETF data shown.")
             return
         _ts = dt.datetime.now(IST).strftime("%H:%M:%S")
-        _srcs = {"nse": "iNAV live from the NSE ETF board",
+        _srcs = {"dhan": "iNAV live intraday from the Dhan feed",
+                 "nse": "iNAV live from the NSE ETF board",
                  "yf": "NAV from the fund quote feed",
                  "amfi": "NAV is each fund's last declared AMFI figure — the live "
                          "iNAV feed is not reachable from this host",
