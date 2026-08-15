@@ -265,26 +265,31 @@ h1,h2,h3,h4,h5 { font-family:'Archivo', sans-serif; letter-spacing:-0.02em; }
 .band{
   position:sticky; top:0; z-index:1000;
   background:linear-gradient(100deg,#111C2B 0%,#123A44 55%,#0E7C86 100%);
-  border-radius:12px; padding:7px 16px; margin-bottom:8px;
+  border-radius:12px; padding:0 18px; margin:0 0 10px; min-height:52px;
   display:flex; align-items:center; justify-content:space-between;
-  flex-wrap:nowrap; gap:14px; box-shadow:0 8px 22px -16px rgba(17,28,43,0.6);
+  flex-wrap:nowrap; gap:16px; box-shadow:0 8px 22px -16px rgba(17,28,43,0.6);
 }
-.band-left{ display:flex; align-items:baseline; gap:14px; min-width:0; flex-wrap:wrap; }
+.band-left{ display:flex; align-items:center; gap:12px; min-width:0; }
+.band-left .band-sub::before{ content:""; display:inline-block; width:1px; height:13px;
+  background:rgba(255,255,255,0.28); margin-right:12px; vertical-align:-2px; }
 .band-name{ font-family:'Archivo',sans-serif; font-weight:700; font-size:1.15rem;
-  color:#FFF; letter-spacing:-0.03em; line-height:1.1; display:flex; align-items:center; gap:8px; }
+  color:#FFF; letter-spacing:-0.03em; line-height:1; display:flex;
+  align-items:center; gap:8px; }
 .band-name .brandmark{ width:22px; height:22px; border-radius:6px; background:#FFF;
   display:inline-flex; align-items:center; justify-content:center; }
 .band-name .m{ color:#5CA8FF; }
 .band-sub{ font-family:'IBM Plex Mono',monospace; font-size:0.74rem;
-  color:#B6D8DC; margin:0; white-space:nowrap; }
+  color:#B6D8DC; margin:0; line-height:1; white-space:nowrap; }
 .idxcard{ background:#FFF; border:1px solid #DDE6ED; border-radius:10px; padding:8px 11px; }
 .idx-n{ font-size:0.66rem; text-transform:uppercase; letter-spacing:0.06em; color:#5E6E7E; font-weight:600; }
 .idx-v{ font-family:'IBM Plex Mono',monospace; font-size:0.9rem; font-weight:600; margin-top:3px; }
 .idx-c{ font-family:'IBM Plex Mono',monospace; font-size:0.74rem; font-weight:600; margin-top:2px; }
 .band-date{ font-family:'IBM Plex Mono',monospace; font-size:0.72rem; color:#EAF6F7;
   background:rgba(255,255,255,0.14); border-radius:999px; padding:4px 12px;
-  white-space:nowrap; }
-.hdr-search div[data-baseweb="select"] > div{ min-height:38px; }
+  line-height:1.4; white-space:nowrap; }
+/* the search shares the banner's row: this spacer centres the control against
+   the 52px band instead of letting it hang off the top edge */
+.hdr-search{ height:7px; }
 
 .sec-label{ font-size:0.72rem; text-transform:uppercase; letter-spacing:0.09em;
   color:var(--muted); font-weight:600; margin:2px 0 6px; }
@@ -381,6 +386,8 @@ div[role="dialog"] .sec-label{ margin:0 0 4px; }
 .sh-table .c-muted{ color:var(--muted); }
 .sh-table .c-rsi{ font-weight:600; font-size:0.9rem; }
 .sh-table .c-vwap{ cursor:help; }
+.sh-table .c-spark{ text-align:center; padding:6px 10px; line-height:0; }
+.sh-table .c-spark svg{ display:block; margin:0 auto; }
 .stat{ resize:both; overflow:auto; min-width:120px; min-height:70px; }
 .sh-table .c-reco{ text-align:center; }
 .sh-table .pill{ font-family:'IBM Plex Mono',monospace; font-size:0.68rem; font-weight:600;
@@ -851,6 +858,40 @@ def fetch_indices(bucket: int = 0) -> list[dict]:
     return out
 
 
+SPARK_UP, SPARK_DOWN = "#0B7A4B", "#C97A16"
+
+
+def spark_svg(series, sessions: int = 30) -> str:
+    """A 30-session close sparkline as inline SVG. Rising is green, falling amber
+    -- a fall in a screener is a signal, not a loss, so it reads as attention
+    rather than alarm."""
+    try:
+        vals = [float(x) for x in series.dropna().tail(sessions).tolist()]
+    except Exception:
+        return ""
+    if len(vals) < 4:
+        return ""
+    lo, hi = min(vals), max(vals)
+    rng = (hi - lo) or 1.0
+    w, h, pad = 64.0, 20.0, 2.5
+    step = w / (len(vals) - 1)
+    pts = " ".join(f"{i * step:.1f},{pad + (1 - (v - lo) / rng) * (h - 2 * pad):.1f}"
+                   for i, v in enumerate(vals))
+    col = SPARK_UP if vals[-1] >= vals[0] else SPARK_DOWN
+    lx, ly = pts.split(" ")[-1].split(",")
+    return (f'<svg width="{w:.0f}" height="{h:.0f}" viewBox="0 0 {w:.0f} {h:.0f}" '
+            f'fill="none" aria-hidden="true">'
+            f'<polyline points="{pts}" stroke="{col}" stroke-width="1.4" '
+            f'stroke-linejoin="round" stroke-linecap="round"/>'
+            f'<circle cx="{lx}" cy="{ly}" r="1.7" fill="{col}"/></svg>')
+
+
+def spark_cell(svg: str, tip: str = "Last 30 sessions") -> str:
+    if not svg:
+        return '<td class="c-spark c-muted">n/a</td>'
+    return f'<td class="c-spark" title="{tip}">{svg}</td>'
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def scan(tickers: tuple[str, ...], threshold: float, fetch_fund_limit: int) -> pd.DataFrame:
     bar = st.progress(0.0, text="Downloading price history...")
@@ -901,6 +942,7 @@ def scan(tickers: tuple[str, ...], threshold: float, fetch_fund_limit: int) -> p
         _vw = compute_vwap(cser, volser_map.get(sym))
         _vwap_pos = ("Above" if price > _vw else "Below") if _vw else "n/a"
         rows.append({
+            "_Spark": spark_svg(cser) if cser is not None else "",
             "Date": dt.date.today().strftime("%d-%m-%Y"),
             "Stock Symbol": sym.replace(".NS", ""),
             "Sector": f["sector"],
@@ -1100,6 +1142,7 @@ def tech_row(symbol: str, d: dict) -> dict:
         "Volume": last_vol, "AvgVol20": avg20,
         "VolX": _numv(last_vol / avg20) if (last_vol and avg20) else None,
         "ATRpct": _atr_pct(h, l, c),
+        "_Spark": spark_svg(c),
     }
 
 
@@ -2099,11 +2142,17 @@ if view == "Custom Screen":
             (COL_META[c][0] if c in COL_META else c,
              "l" if c in ("Sector",) else "c" if c == "Buy/Sell" else "r")
             for c in _cols[1:]]
+        if "Price" in _cols:
+            _heads.insert(_cols.index("Price"), ("Trend", "c"))
         _rows = []
         for _, _r2 in _view_df.iterrows():
             _cells = [f'<td><a class="c-sym" href="?view=custom&stock={_r2["Symbol"]}" '
                       f'target="_self">{_html.escape(str(_r2["Symbol"]))}</a></td>']
-            _cells += [metric_cell(c, _r2.get(c)) for c in _cols[1:]]
+            for _c3 in _cols[1:]:
+                if _c3 == "Price":
+                    _cells.append(spark_cell(_r2.get("_Spark", ""),
+                                             "Closing price, last 30 sessions"))
+                _cells.append(metric_cell(_c3, _r2.get(_c3)))
             _rows.append("<tr>" + "".join(_cells) + "</tr>")
         st.markdown('<div class="sh-hint">Click a symbol for the full detail view. '
                     "Columns follow your conditions.</div>", unsafe_allow_html=True)
@@ -2251,7 +2300,7 @@ if view == "ETFs":
 
         _e_cols = ["Price", "iNAV", "PremDisc", "Chg1D", "Chg1W", "Chg1M", "Chg1Y",
                    "RSI", "Vs200", "High52", "Low52", "Volume"]
-        _e_heads = [("Symbol", "l"), ("ETF", "l"), ("Category", "l")] + \
+        _e_heads = [("Symbol", "l"), ("ETF", "l"), ("Category", "l"), ("Trend", "c")] + \
                    [(COL_META[c][0], "r") for c in _e_cols]
         _e_rows = []
         for _, _r3 in _pool.iterrows():
@@ -2262,6 +2311,7 @@ if view == "ETFs":
                 f'<td style="font-weight:500">{_html.escape(str(_r3["Name"]))}</td>'
                 f'<td class="c-sec" style="color:{sector_color(_r3["Category"])}">'
                 f'{_html.escape(str(_r3["Category"]))}</td>'
+                + spark_cell(_r3.get("_Spark", ""), "Closing price, last 30 sessions")
                 + "".join(metric_cell(c, _r3.get(c)) for c in _e_cols)
                 + "</tr>")
         st.markdown(sh_table(_e_heads, _e_rows), unsafe_allow_html=True)
@@ -2396,8 +2446,11 @@ else:
         return f"{x:,.2f}" if isinstance(x, (int, float)) else str(x)
 
     aligns = ["l", "l", "l", "r", "r", "r", "c", "r", "r", "c", "r", "r"]
+    _hpairs = list(zip(HEADERS, aligns))
+    _pi = [h for h, _a in _hpairs].index("Current Price (Rs)")
+    _hpairs.insert(_pi, ("Trend", "c"))
     head_html = "".join(
-        f'<th class="th-{a}">{COL_LABELS.get(h, h)}</th>' for h, a in zip(HEADERS, aligns))
+        f'<th class="th-{a}">{COL_LABELS.get(h, h)}</th>' for h, a in _hpairs)
 
     _cfgq = quote(st.query_params.get("scan", ""), safe="")
     body_rows = []
@@ -2421,6 +2474,7 @@ else:
             f'<td class="c-date">{r["Date"]}</td>'
             f'<td><a class="c-sym" href="{href}" target="_self">{sym}</a></td>'
             f'<td class="c-sec" style="color:{sector_color(r["Sector"])}">{_html.escape(str(r["Sector"]))}</td>'
+            + spark_cell(r.get("_Spark", ""), "Closing price, last 30 sessions") +
             f'<td class="c-num c-price" title="{sma_tip}">{_fmt(r["Current Price (Rs)"])}</td>'
             f'<td class="c-num c-muted">{_vol(r.get("Volume"))}</td>'
             f'<td class="c-num c-rsi" style="color:{rsi_color(rsi)}">{rsi_txt}</td>'
@@ -2436,6 +2490,7 @@ else:
             "</tr>")
 
     st.markdown('<div class="sh-hint">Click a stock symbol for its full detail. '
+                "Trend is the closing price over the last 30 sessions. "
                 "Hover the underlined price to see 20 / 50 / 200-day moving averages."
                 "</div>", unsafe_allow_html=True)
     st.markdown(
