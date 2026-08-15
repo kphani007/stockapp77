@@ -1821,6 +1821,26 @@ def _open_in_screener(sym: str) -> None:
     st.rerun()
 
 
+# --- live-tick settings (kept in code; no sidebar UI) ---
+live_on = True
+live_every = 1
+
+# --- top nav: Screener / Stock OI / News ---
+_view_map = {"screener": "Screener", "custom": "Custom Screen",
+             "mf": "Mutual Funds", "etf": "ETFs",
+             "oi": "Stock OI", "news": "News"}
+_qp_view = str(st.query_params.get("view", "")).lower()
+if _qp_view in _view_map and "view" not in st.session_state:
+    st.session_state["view"] = _view_map[_qp_view]
+st.session_state.setdefault("view", "Screener")
+st.sidebar.markdown('<div class="nav-h">Sections</div>', unsafe_allow_html=True)
+view = st.sidebar.radio("view", ["Screener", "Stock OI", "Custom Screen", "ETFs",
+                                "Mutual Funds", "News"],
+                        label_visibility="collapsed", key="view")
+st.sidebar.markdown('<div class="nav-foot">Collapse this panel with the arrow above. '
+                    'Data is reference only — not investment advice.</div>',
+                    unsafe_allow_html=True)
+
 # --- header row: compact banner, with the stock search beside it on the tabs
 # where a stock lookup makes sense (mutual funds and ETFs have their own search)
 _SEARCH_TABS = {"Screener", "Custom Screen", "Stock OI", "News"}
@@ -1848,25 +1868,6 @@ if view in _SEARCH_TABS:
 else:
     st.markdown(_BAND_HTML, unsafe_allow_html=True)
 
-# --- live-tick settings (kept in code; no sidebar UI) ---
-live_on = True
-live_every = 1
-
-# --- top nav: Screener / Stock OI / News ---
-_view_map = {"screener": "Screener", "custom": "Custom Screen",
-             "mf": "Mutual Funds", "etf": "ETFs",
-             "oi": "Stock OI", "news": "News"}
-_qp_view = str(st.query_params.get("view", "")).lower()
-if _qp_view in _view_map and "view" not in st.session_state:
-    st.session_state["view"] = _view_map[_qp_view]
-st.session_state.setdefault("view", "Screener")
-st.sidebar.markdown('<div class="nav-h">Sections</div>', unsafe_allow_html=True)
-view = st.sidebar.radio("view", ["Screener", "Stock OI", "Custom Screen", "ETFs",
-                                "Mutual Funds", "News"],
-                        label_visibility="collapsed", key="view")
-st.sidebar.markdown('<div class="nav-foot">Collapse this panel with the arrow above. '
-                    'Data is reference only — not investment advice.</div>',
-                    unsafe_allow_html=True)
 
 # --- hyperlink handler: ?stock=SYMBOL opens the detail dialog in any view ---
 qp_stock = st.query_params.get("stock")
