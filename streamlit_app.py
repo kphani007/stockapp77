@@ -387,7 +387,21 @@ div[role="dialog"] .sec-label{ margin:0 0 4px; }
 /* pull content up + strip default header/sidebar chrome */
 [data-testid="stHeader"]{ background:transparent; height:0; }
 .block-container{ padding-top:1.1rem !important; }
-[data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"]{ display:none !important; }
+/* --- left nav (collapsible sidebar) --- */
+[data-testid="stSidebar"]{ background:#111C2B; border-right:1px solid #1E2E42; }
+[data-testid="stSidebar"] *{ color:#EAF6F7; }
+[data-testid="stSidebar"] .nav-h{ font-family:'Archivo',sans-serif; font-size:0.68rem;
+  letter-spacing:0.1em; text-transform:uppercase; color:#7FA8B5; font-weight:700;
+  margin:2px 0 10px; }
+[data-testid="stSidebar"] div[role="radiogroup"]{ display:flex; flex-direction:column; gap:3px; }
+[data-testid="stSidebar"] div[role="radiogroup"] label{ padding:9px 12px; border-radius:9px;
+  font-size:0.93rem; font-weight:500; cursor:pointer; width:100%; }
+[data-testid="stSidebar"] div[role="radiogroup"] label > div:first-child{ display:none; }
+[data-testid="stSidebar"] div[role="radiogroup"] label:hover{ background:rgba(255,255,255,0.09); }
+[data-testid="stSidebar"] div[role="radiogroup"] label:has(input:checked){ background:#0E7C86; }
+[data-testid="stSidebar"] div[role="radiogroup"] label:has(input:checked) p{ font-weight:700; }
+[data-testid="stSidebar"] .nav-foot{ font-size:0.7rem; color:#7FA8B5; line-height:1.5;
+  margin-top:14px; }
 /* movable + resizable detail dialog */
 div[role="dialog"]{ resize:both; overflow:auto; min-width:340px; min-height:220px; }
 div[role="dialog"]:hover{ box-shadow:0 20px 60px rgba(17,28,43,0.35); }
@@ -730,7 +744,7 @@ def fetch_fundamentals(symbol: str) -> dict:
     return {"name": name, "sector": sector, "reco": reco, "target": target, "pe": pe}
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def fetch_detail(symbol: str) -> dict:
     out = {"name": symbol.replace(".NS", ""), "sector": "n/a", "mcap": None,
            "price": None, "high52": None, "low52": None, "rsi": None,
@@ -969,6 +983,8 @@ NUM_COLS = [
     ("Upside", "Upside to target %", "F", 2),
 ]
 COL_META = {c: (lab, grp, dp) for c, lab, grp, dp in NUM_COLS}
+COL_META["iNAV"] = ("iNAV (Rs)", "T", 2)      # ETF-only, not a stock screen filter
+COL_META["PremDisc"] = ("Prem / disc %", "T", 2)
 FUND_KEYS = {c for c, _l, g, _d in NUM_COLS if g == "F"}
 
 PRESETS = {
@@ -986,8 +1002,10 @@ PRESETS = {
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def bulk_ohlcv(tickers: tuple[str, ...]) -> dict:
-    """One batched 1-year daily OHLCV download for a whole universe."""
+def bulk_ohlcv(tickers: tuple[str, ...], bucket: int = 0) -> dict:
+    """One batched 1-year daily OHLCV download for a whole universe. `bucket` is
+    a time slot -- pass int(time.time() // 60) to force a fresh pull each minute
+    while the market is open."""
     out: dict = {}
     batch, n = 200, len(tickers)
     bar = st.progress(0.0, text="Downloading price history...")
@@ -1316,17 +1334,97 @@ ETF_META = {s: (n, c) for s, n, c in ETF_LIST}
 ETF_CATEGORIES = list(dict.fromkeys(c for _s, _n, c in ETF_LIST))
 
 
-@st.cache_data(ttl=600, show_spinner=False)
-def scan_etfs() -> pd.DataFrame:
-    data = bulk_ohlcv(tuple(f"{s}.NS" for s, _n, _c in ETF_LIST))
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_nse_etf_live(bucket: int = 0) -> dict:
+    """Live ETF board from NSE -- iNAV, last traded price and day change for the
+    whole list in ONE request, so iNAV can refresh on the same 1-minute cycle as
+    prices instead of a slow per-fund lookup."""
+    hdr = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+           "Accept": "application/json, text/plain, */*",
+           "Accept-Language": "en-US,en;q=0.9",
+           "Referer": "https://www.nseindia.com/market-data/exchange-traded-funds-etf"}
+    try:
+        sess = requests.Session()
+        sess.headers.update(hdr)
+        sess.get("https://www.nseindia.com/market-data/exchange-traded-funds-etf",
+                 timeout=8)
+        rows = (sess.get("https://www.nseindia.com/api/etf", timeout=10).json()
+                or {}).get("data") or []
+    except Exception:
+        return {}
+    out: dict = {}
+    for d in rows:
+        sym = str(d.get("symbol", "")).strip().upper()
+        if not sym:
+            continue
+
+        def num(*keys):
+            for k in keys:
+                v = d.get(k)
+                if isinstance(v, (int, float)):
+                    return float(v)
+                if isinstance(v, str):
+                    try:
+                        return float(v.replace(",", "").strip())
+                    except ValueError:
+                        continue
+            return None
+
+        out[sym] = {"inav": num("nav", "iNav", "inav"),
+                    "ltp": num("ltP", "lastPrice", "ltp"),
+                    "chg": num("per", "pChange"),
+                    "prev": num("prevClose", "previousClose")}
+    return out
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def etf_inav(symbols: tuple[str, ...], bucket: int = 0) -> dict:
+    """Fallback iNAV, one lookup per fund, used only for ETFs the NSE board did
+    not return. Missing values stay None and render as 'n/a', never the market
+    price dressed up as NAV."""
+    out: dict = {}
+    if not symbols:
+        return out
+    bar = st.progress(0.0, text="Reading ETF NAVs...")
+    for i, sym in enumerate(symbols):
+        try:
+            info = yf.Ticker(sym).info or {}
+            out[sym.replace(".NS", "")] = _numv(info.get("navPrice")
+                                                or info.get("netAssetValue"))
+        except Exception:
+            out[sym.replace(".NS", "")] = None
+        bar.progress((i + 1) / len(symbols), text=f"NAVs {i + 1}/{len(symbols)}")
+    bar.empty()
+    return out
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def scan_etfs(price_bucket: int = 0, nav_bucket: int = 0) -> tuple[pd.DataFrame, bool]:
+    """ETF technicals, live price and iNAV. Returns (rows, iNAV came from the
+    live NSE board)."""
+    data = bulk_ohlcv(tuple(f"{s}.NS" for s, _n, _c in ETF_LIST), price_bucket)
+    live = fetch_nse_etf_live(price_bucket)
+    missing = tuple(s for s in data
+                    if not (live.get(s.replace(".NS", "").upper()) or {}).get("inav"))
+    navs = etf_inav(missing, nav_bucket)
     rows = []
     for sym, d in data.items():
         r = tech_row(sym, d)
         name, cat = ETF_META.get(r["Symbol"], ("", "Other"))
         r["Name"], r["Category"] = name, cat
+        lv = live.get(r["Symbol"].upper()) or {}
+        if lv.get("ltp"):
+            r["Price"] = _numv(lv["ltp"])
+        if lv.get("chg") is not None:
+            r["Chg1D"] = _numv(lv["chg"])
+        r["iNAV"] = lv.get("inav") or navs.get(r["Symbol"])
+        r["PremDisc"] = (_numv((r["Price"] / r["iNAV"] - 1) * 100)
+                         if r["iNAV"] and r["Price"] else None)
         rows.append(r)
     df = pd.DataFrame(rows)
-    return df.sort_values("Symbol").reset_index(drop=True) if not df.empty else df
+    if df.empty:
+        return df, bool(live)
+    return df.sort_values("Symbol").reset_index(drop=True), bool(live)
 
 
 # ------------------------- shared table + export ---------------------------
@@ -1467,7 +1565,8 @@ def render_detail(symbol: str):
         _stat("RSI (14d)", rsi,
               "overbought zone" if d["rsi"] and d["rsi"] >= 70 else "momentum", "a"),
         _stat("52-week range", rng, "", "b"),
-        _stat("1-year forecast", tgt, f"consensus: {d['reco']}", "g"),
+        _stat("1-year forecast", tgt,
+              f"mean analyst target · {d['reco']}", "g"),
         _stat("Face value", face, "", "v"),
         _stat("Book value", book, "per share", "b"),
         _stat("Beta", beta, "volatility vs market", "a"),
@@ -1671,7 +1770,8 @@ def _maybe_show_admin_stats() -> None:
 # ---------------------------------- app -----------------------------------
 
 st.set_page_config(page_title="StockMerit — NSE RSI Screener",
-                   page_icon="📊", layout="wide")
+                   page_icon="📊", layout="wide",
+                   initial_sidebar_state="expanded")
 st.markdown(CSS, unsafe_allow_html=True)
 
 _inject_ga()
@@ -1696,7 +1796,7 @@ st.markdown(
     '<span style="letter-spacing:-0.02em"><span style="color:#FFFFFF">Stock</span>'
     '<span style="color:#5CA8FF">Mer</span>'
     '<span style="color:#FFFFFF">it</span></span></div>'
-    '<div class="band-sub">Analyze at one place …</div></div>'
+    '<div class="band-sub">Analyze it. Stock it.</div></div>'
     f'<div class="band-date">{dt.date.today().strftime("%d-%m-%Y")}</div></div>',
     unsafe_allow_html=True)
 
@@ -1750,9 +1850,13 @@ _qp_view = str(st.query_params.get("view", "")).lower()
 if _qp_view in _view_map and "view" not in st.session_state:
     st.session_state["view"] = _view_map[_qp_view]
 st.session_state.setdefault("view", "Screener")
-view = st.radio("view", ["Screener", "Custom Screen", "Mutual Funds", "ETFs",
-                         "Stock OI", "News"],
-                horizontal=True, label_visibility="collapsed", key="view")
+st.sidebar.markdown('<div class="nav-h">Sections</div>', unsafe_allow_html=True)
+view = st.sidebar.radio("view", ["Screener", "Custom Screen", "Mutual Funds", "ETFs",
+                                "Stock OI", "News"],
+                        label_visibility="collapsed", key="view")
+st.sidebar.markdown('<div class="nav-foot">Collapse this panel with the arrow above. '
+                    'Data is reference only — not investment advice.</div>',
+                    unsafe_allow_html=True)
 
 # --- hyperlink handler: ?stock=SYMBOL opens the detail dialog in any view ---
 qp_stock = st.query_params.get("stock")
@@ -1814,7 +1918,7 @@ if view == "Stock OI":
     st.stop()
 
 SIGNED_COLS = {"Chg1D", "Chg1W", "Chg1M", "Chg3M", "Chg6M", "Chg1Y", "Vs200",
-               "VsVWAP", "Upside", "RevGrowth", "ProfitGrowth"}
+               "VsVWAP", "Upside", "RevGrowth", "ProfitGrowth", "PremDisc"}
 PCT_COLS = {"FromHigh", "FromLow", "ROE", "ROA", "DivYld", "OpMargin",
             "NetMargin", "ATRpct"}
 
@@ -1853,12 +1957,16 @@ if view == "Custom Screen":
         if _c.button(_n, use_container_width=True, key=f"cs_u_{_n}",
                      type="primary" if st.session_state["cs_universe"] == _n else "secondary"):
             st.session_state["cs_universe"] = _n
+            for _k in ("cs_sectors", "cs_results", "cs_fund", "cs_sort", "cs_dir"):
+                st.session_state.pop(_k, None)
             st.rerun()
     _cs_run = _urow[3].button("Run screen", type="primary", key="cs_run",
                              use_container_width=True)
     _cs_reset = _urow[4].button("Reset", key="cs_reset", use_container_width=True)
     if _cs_reset:
-        for _k in ("cs_filters", "cs_results", "cs_sectors", "cs_fund"):
+        for _k in ("cs_filters", "cs_results", "cs_priced", "cs_fund", "cs_sectors",
+                   "cs_metric", "cs_op", "cs_v1", "cs_v2", "cs_preset", "cs_dir",
+                   "cs_sort", "cs_universe"):
             st.session_state.pop(_k, None)
         st.rerun()
 
@@ -1869,14 +1977,12 @@ if view == "Custom Screen":
     _by_label = {f"{'Technical' if g == 'T' else 'Fundamental'} · {lab}": col
                  for col, lab, g, _d in NUM_COLS}
     _b = st.columns([3, 1.6, 1.3, 1.3, 1.4], gap="small")
-    _m = _b[0].selectbox("Value", _opts, key="cs_metric", label_visibility="collapsed")
-    _op = _b[1].selectbox("Condition", ["at least", "at most", "between"],
-                          key="cs_op", label_visibility="collapsed")
-    _v1 = _b[2].number_input("min", value=None, key="cs_v1",
-                             label_visibility="collapsed", placeholder="value")
-    _v2 = _b[3].number_input("max", value=None, key="cs_v2",
-                             label_visibility="collapsed", placeholder="upper",
+    _m = _b[0].selectbox("Value", _opts, key="cs_metric")
+    _op = _b[1].selectbox("Condition", ["at least", "at most", "between"], key="cs_op")
+    _v1 = _b[2].number_input("Value", value=None, key="cs_v1", placeholder="number")
+    _v2 = _b[3].number_input("Upper", value=None, key="cs_v2", placeholder="number",
                              disabled=_op != "between")
+    _b[4].markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
     if _b[4].button("Add", use_container_width=True, key="cs_add"):
         if _v1 is None or (_op == "between" and _v2 is None):
             st.warning("Enter a value for the condition.")
@@ -1888,13 +1994,14 @@ if view == "Custom Screen":
 
     _pc = st.columns([3, 3, 1.4], gap="small")
     _preset = _pc[0].selectbox("Preset", ["Start from a preset..."] + list(PRESETS),
-                              key="cs_preset", label_visibility="collapsed")
+                              key="cs_preset")
     _sectors = _pc[1].multiselect(
-        "Sectors", sorted({"Financial Services", "Technology", "Healthcare",
-                           "Consumer Cyclical", "Consumer Defensive", "Industrials",
-                           "Basic Materials", "Energy", "Utilities",
-                           "Communication Services", "Real Estate"}),
-        key="cs_sectors", placeholder="Any sector", label_visibility="collapsed")
+        "Sector", sorted({"Financial Services", "Technology", "Healthcare",
+                          "Consumer Cyclical", "Consumer Defensive", "Industrials",
+                          "Basic Materials", "Energy", "Utilities",
+                          "Communication Services", "Real Estate"}),
+        key="cs_sectors", placeholder="All sectors")
+    _pc[2].markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
     if _pc[2].button("Apply preset", use_container_width=True, key="cs_apply_preset"):
         if _preset in PRESETS:
             st.session_state["cs_filters"] = [
@@ -1951,7 +2058,7 @@ if view == "Custom Screen":
         _cols = [c for c in _cols[:13] if c in _res.columns]
 
         _sortable = [c for c in _cols if c not in ("Symbol", "Sector", "Buy/Sell")]
-        _sc = st.columns([2, 1.4, 2.6, 1.6], gap="small")
+        _sc = st.columns([2, 2, 2.4, 1.6], gap="small")
         _sort = _sc[0].selectbox("Sort by", _sortable,
                                  format_func=lambda c: COL_META[c][0])
         _dir = _sc[1].selectbox("Order", ["High to low", "Low to high"], key="cs_dir")
@@ -2000,7 +2107,7 @@ if view == "Mutual Funds":
                f"(latest published {_mf['Date'].iloc[0]}). Returns come from each "
                "scheme's own NAV history; over 1 year they are annualised.")
 
-    _f1 = st.columns([1.6, 2.2, 2.6, 2], gap="small")
+    _f1 = st.columns([2, 2, 2.4, 1.6], gap="small")
     _type = _f1[0].selectbox("Type", ["All types"] + sorted(_mf["Type"].unique()),
                              key="mf_type")
     _pool = _mf if _type == "All types" else _mf[_mf["Type"] == _type]
@@ -2014,7 +2121,7 @@ if view == "Mutual Funds":
     if _q and _q.strip():
         _pool = _pool[_pool["Scheme"].str.contains(_q.strip(), case=False, na=False)]
 
-    _o1 = st.columns([1.4, 1.4, 2.6, 1.6], gap="small")
+    _o1 = st.columns([2, 2, 2.4, 1.6], gap="small")
     _plan = _o1[0].selectbox("Plan", ["Any plan", "Direct only", "Regular only"],
                              key="mf_plan")
     if _plan == "Direct only":
@@ -2075,54 +2182,75 @@ if view == "Mutual Funds":
 # ================================ ETFs view ================================
 if view == "ETFs":
     st.markdown("### ETFs")
-    _etf = scan_etfs()
-    if _etf.empty:
-        st.error("The market feed is unreachable right now — no ETF data shown.")
-        st.stop()
-    st.caption(f"{len(_etf)} NSE-listed ETFs with live technicals on the same engine "
-               "as the stock screener. Click a symbol for its price levels.")
+    _etf_live = market_open()
 
-    _e1 = st.columns([2, 2, 2.4, 1.6], gap="small")
-    _ecat = _e1[0].selectbox("Category", ["All categories"] + ETF_CATEGORIES, key="etf_cat")
-    _pool = _etf if _ecat == "All categories" else _etf[_etf["Category"] == _ecat]
-    _eq = _e1[1].text_input("Search", key="etf_q", placeholder="e.g. gold",
-                            label_visibility="visible")
-    if _eq and _eq.strip():
-        _m = _eq.strip()
-        _pool = _pool[_pool["Symbol"].str.contains(_m, case=False, na=False)
-                      | _pool["Name"].str.contains(_m, case=False, na=False)]
-    _esort = _e1[2].selectbox(
-        "Sort by", ["Chg1D", "Chg1M", "Chg1Y", "RSI", "Volume", "Price", "Vs200"],
-        format_func=lambda c: COL_META[c][0], key="etf_sort")
-    _pool = _pool.sort_values(_esort, ascending=False, na_position="last")
-    _e1[3].download_button(
-        "⤓  Download", key="etf_dl",
-        data=df_to_excel_bytes(
-            _pool[["Symbol", "Name", "Category", "Price", "Chg1D", "Chg1M", "Chg1Y",
-                   "RSI", "Vs200", "High52", "Low52", "Volume", "AvgVol20"]],
-            "ETFs", {c: COL_META[c][0] for c in COL_META}),
-        file_name=f"ETFs_{dt.date.today().isoformat()}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True)
+    @st.fragment(run_every=(60 if _etf_live else None))
+    def render_etf_tab():
+        # prices refresh on a 1-minute bucket, iNAVs on a 5-minute bucket, so
+        # every figure on this tab tracks live trade while the market is open
+        _etf, _nse_live = scan_etfs(int(time.time() // 60) if _etf_live else 0,
+                                    int(time.time() // 300) if _etf_live else 0)
+        if _etf.empty:
+            st.error("The market feed is unreachable right now — no ETF data shown.")
+            return
+        _ts = dt.datetime.now(IST).strftime("%H:%M:%S")
+        _src = ("prices and iNAV from the NSE ETF board" if _nse_live
+                else "prices live; iNAV from the fund quote feed")
+        st.caption(
+            (f"🟢 Live · {len(_etf)} NSE-listed ETFs · {_src}, updated {_ts} IST "
+             "and refreshing every minute."
+             if _etf_live else
+             f"⚪ Market closed · {len(_etf)} NSE-listed ETFs at last close ({_ts} IST).")
+            + " Click a symbol for its price levels.")
 
-    _e_cols = ["Price", "Chg1D", "Chg1W", "Chg1M", "Chg1Y", "RSI", "Vs200",
-               "High52", "Low52", "Volume"]
-    _e_heads = [("Symbol", "l"), ("ETF", "l"), ("Category", "l")] + \
-               [(COL_META[c][0], "r") for c in _e_cols]
-    _e_rows = []
-    for _, _r3 in _pool.iterrows():
-        _e_rows.append(
-            "<tr>"
-            f'<td><a class="c-sym" href="?view=etf&stock={_r3["Symbol"]}" '
-            f'target="_self">{_html.escape(str(_r3["Symbol"]))}</a></td>'
-            f'<td style="font-weight:500">{_html.escape(str(_r3["Name"]))}</td>'
-            f'<td class="c-sec" style="color:{sector_color(_r3["Category"])}">'
-            f'{_html.escape(str(_r3["Category"]))}</td>'
-            + "".join(metric_cell(c, _r3.get(c)) for c in _e_cols)
-            + "</tr>")
-    st.markdown(sh_table(_e_heads, _e_rows), unsafe_allow_html=True)
-    st.caption("Gold, silver and international ETFs track their own underlying, so "
-               "RSI and moving averages describe the ETF price, not an index.")
+        _e1 = st.columns([2, 2, 2.4, 1.6], gap="small")
+        _ecat = _e1[0].selectbox("Category", ["All categories"] + ETF_CATEGORIES, key="etf_cat")
+        _pool = _etf if _ecat == "All categories" else _etf[_etf["Category"] == _ecat]
+        _eq = _e1[1].text_input("Search", key="etf_q", placeholder="e.g. gold",
+                                label_visibility="visible")
+        if _eq and _eq.strip():
+            _m = _eq.strip()
+            _pool = _pool[_pool["Symbol"].str.contains(_m, case=False, na=False)
+                          | _pool["Name"].str.contains(_m, case=False, na=False)]
+        _esort = _e1[2].selectbox(
+            "Sort by", ["Chg1D", "Chg1M", "Chg1Y", "RSI", "PremDisc", "Volume",
+                        "Price", "Vs200"],
+            format_func=lambda c: COL_META[c][0], key="etf_sort")
+        _pool = _pool.sort_values(_esort, ascending=False, na_position="last")
+        _e1[3].download_button(
+            "⤓  Download", key="etf_dl",
+            data=df_to_excel_bytes(
+                _pool[["Symbol", "Name", "Category", "Price", "iNAV", "PremDisc",
+                       "Chg1D", "Chg1M", "Chg1Y", "RSI", "Vs200", "High52", "Low52",
+                       "Volume", "AvgVol20"]],
+                "ETFs", {c: COL_META[c][0] for c in COL_META}),
+            file_name=f"ETFs_{dt.date.today().isoformat()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True)
+
+        _e_cols = ["Price", "iNAV", "PremDisc", "Chg1D", "Chg1W", "Chg1M", "Chg1Y",
+                   "RSI", "Vs200", "High52", "Low52", "Volume"]
+        _e_heads = [("Symbol", "l"), ("ETF", "l"), ("Category", "l")] + \
+                   [(COL_META[c][0], "r") for c in _e_cols]
+        _e_rows = []
+        for _, _r3 in _pool.iterrows():
+            _e_rows.append(
+                "<tr>"
+                f'<td><a class="c-sym" href="?view=etf&stock={_r3["Symbol"]}" '
+                f'target="_self">{_html.escape(str(_r3["Symbol"]))}</a></td>'
+                f'<td style="font-weight:500">{_html.escape(str(_r3["Name"]))}</td>'
+                f'<td class="c-sec" style="color:{sector_color(_r3["Category"])}">'
+                f'{_html.escape(str(_r3["Category"]))}</td>'
+                + "".join(metric_cell(c, _r3.get(c)) for c in _e_cols)
+                + "</tr>")
+        st.markdown(sh_table(_e_heads, _e_rows), unsafe_allow_html=True)
+        st.caption("iNAV is the fund's indicative net asset value per unit, refreshed "
+                   "with the prices; prem / disc is how far the traded price sits "
+                   "above or below it. Gold, silver and international ETFs track their "
+                   "own underlying, so RSI and moving averages describe the ETF price, "
+                   "not an index.")
+
+    render_etf_tab()
     st.markdown(f'<div class="disc"><strong>Disclaimer</strong> — {DISCLAIMER}</div>',
                 unsafe_allow_html=True)
     st.stop()
@@ -2164,6 +2292,7 @@ for col, name in zip(row[:3], UNIVERSES):
                   type="primary" if st.session_state["universe"] == name else "secondary",
                   key=f"u_{name}"):
         st.session_state["universe"] = name
+        st.session_state.pop("bs_filter", None)
         st.rerun()
 universe_choice = st.session_state["universe"]
 uploaded = None
@@ -2182,7 +2311,7 @@ if universe_choice == "All NIFTY Stocks":
 
 if clear:
     for k in ("results", "scanned", "threshold", "opened_for", "screener_table",
-              "qp_opened", "rsi_thr", "universe", "view"):
+              "qp_opened", "rsi_thr", "universe", "view", "bs_filter"):
         st.session_state.pop(k, None)
     st.query_params.clear()
     st.rerun()
@@ -2196,6 +2325,7 @@ if run:
     st.session_state["scanned"] = len(tickers)
     st.session_state["threshold"] = threshold
     st.session_state["opened_for"] = None
+    st.session_state.pop("bs_filter", None)
     st.query_params["scan"] = _cfg_str(universe_choice, threshold, FUND_LIMIT)
     if "stock" in st.query_params:
         del st.query_params["stock"]
@@ -2228,8 +2358,8 @@ elif results.empty:
 else:
     _all_bs = [b for b in ["Buy", "Sell", "Hold", "Neutral"]
                if b in set(results["Buy/Sell"].astype(str))]
-    _fc1, _fc2 = st.columns([1, 3], gap="small")
-    _bs_choice = _fc1.selectbox("Buy/Sell filter", ["All"] + _all_bs, index=0)
+    _fc1, _fc2 = st.columns([2, 6], gap="small")
+    _bs_choice = _fc1.selectbox("Buy/Sell", ["All"] + _all_bs, index=0, key="bs_filter")
     if _bs_choice != "All":
         results = results[results["Buy/Sell"].astype(str) == _bs_choice]
     hleft, hright = st.columns([4, 1], gap="small")
