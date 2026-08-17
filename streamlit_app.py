@@ -1454,6 +1454,176 @@ def mf_returns(code: str) -> dict:
     return out
 
 
+# ------------------- specialized investment funds (SIF) --------------------
+# SEBI's asset class between mutual funds and PMS (Rs 10 lakh minimum). AMFI
+# publishes SIF NAVs in its own daily feed, separate from NAVAll.txt, and the
+# endpoint has moved more than once - so try the known forms in order and say
+# on the tab which one answered. Nothing is invented when they all fail.
+_SIF_NAV_URLS = (
+    "https://portal.amfiindia.com/spages/SIFNAVAll.txt",
+    "https://www.amfiindia.com/spages/SIFNAVAll.txt",
+    "https://portal.amfiindia.com/spages/SIFNAV.txt",
+    "https://www.amfiindia.com/api/download-excel/sif-latest-nav",
+    "https://www.amfiindia.com/sif/latest-nav",
+)
+
+
+def _sif_plan(name: str) -> str:
+    return "Direct" if "direct" in (name or "").lower() else "Regular"
+
+
+def _sif_option(name: str) -> str:
+    n = (name or "").lower()
+    if "growth" in n:
+        return "Growth"
+    if "idcw" in n or "dividend" in n:
+        return "IDCW"
+    return "-"
+
+
+def _sif_strategy(category: str, name: str) -> str:
+    """Strategy family, from AMFI's own category header where it carries one,
+    otherwise from words SEBI's SIF strategy names are required to use."""
+    hay = f"{category} {name}".lower()
+    for key, label in (("sector rotation", "Sector rotation long-short"),
+                       ("ex-top 100", "Equity ex-top 100 long-short"),
+                       ("ex top 100", "Equity ex-top 100 long-short"),
+                       ("hybrid", "Hybrid long-short"),
+                       ("asset alloc", "Active asset allocator"),
+                       ("debt", "Debt long-short"),
+                       ("equity", "Equity long-short")):
+        if key in hay:
+            return label
+    return (category or "Other").strip()
+
+
+def _parse_amfi_semicolon(text: str) -> list[dict]:
+    """AMFI's block text format: house / category headers, then
+    code;isin;isin;scheme;nav;date rows."""
+    rows, house, cat = [], "", ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if ";" not in line:
+            if "(" in line and ")" in line and ("Strateg" in line or "Scheme" in line):
+                cat = line[line.find("(") + 1:line.rfind(")")].strip() or line
+            else:
+                cat = cat if line.lower().startswith("scheme") else cat
+                house = line.replace("Specialized Investment Fund", "").strip() or house
+            continue
+        parts = [p.strip() for p in line.split(";")]
+        if len(parts) < 6 or not parts[0].isdigit():
+            continue
+        try:
+            nav = float(parts[4])
+        except (ValueError, IndexError):
+            continue
+        rows.append({"Code": parts[0], "Scheme": parts[3], "House": house,
+                     "Category": cat, "NAV": round(nav, 4), "Date": parts[5]})
+    return rows
+
+
+def _parse_sif_html(body: str) -> list[dict]:
+    try:
+        tables = pd.read_html(io.StringIO(body))
+    except Exception:
+        return []
+    for t in tables:
+        cols = {str(c).strip().lower(): c for c in t.columns}
+        nav_c = next((v for k, v in cols.items() if "nav" in k and "date" not in k), None)
+        name_c = next((v for k, v in cols.items()
+                       if "scheme" in k or "strateg" in k or "name" in k), None)
+        if nav_c is None or name_c is None or len(t) < 1:
+            continue
+        date_c = next((v for k, v in cols.items() if "date" in k), None)
+        house_c = next((v for k, v in cols.items()
+                        if "fund" in k or "amc" in k or "house" in k), None)
+        out = []
+        for _, r in t.iterrows():
+            try:
+                nav = float(str(r[nav_c]).replace(",", ""))
+            except (ValueError, TypeError):
+                continue
+            out.append({"Code": "", "Scheme": str(r[name_c]).strip(),
+                        "House": (str(r[house_c]).strip() if house_c is not None else ""),
+                        "Category": "", "NAV": round(nav, 4),
+                        "Date": (str(r[date_c]).strip() if date_c is not None else "")})
+        if out:
+            return out
+    return []
+
+
+@st.cache_data(ttl=10800, show_spinner=False)
+def load_sifs() -> tuple[pd.DataFrame, str]:
+    """Every SIF investment strategy AMFI publishes a NAV for. Returns
+    (rows, the endpoint that answered) - empty frame if none did."""
+    for url in _SIF_NAV_URLS:
+        try:
+            r = requests.get(url, timeout=20,
+                             headers={"User-Agent": "Mozilla/5.0",
+                                      "Accept": "text/html,text/plain,*/*"})
+            body = r.text or ""
+            if r.status_code != 200 or len(body) < 40:
+                continue
+            rows = (_parse_amfi_semicolon(body) if ";" in body[:4000]
+                    else _parse_sif_html(body))
+            if not rows and "<table" in body.lower():
+                rows = _parse_sif_html(body)
+            if not rows:
+                continue
+            df = pd.DataFrame(rows)
+            df["House"] = df["House"].replace("", pd.NA).fillna("-")
+            df["Plan"] = df["Scheme"].map(_sif_plan)
+            df["Option"] = df["Scheme"].map(_sif_option)
+            df["Strategy"] = [_sif_strategy(c, n)
+                              for c, n in zip(df["Category"], df["Scheme"])]
+            return df.reset_index(drop=True), url
+        except Exception:
+            continue
+    return pd.DataFrame(), ""
+
+
+@st.cache_data(ttl=10800, show_spinner=False)
+def sif_history(code: str) -> dict:
+    """Point-to-point returns for one strategy from its published NAV history.
+    SIF codes live in the same AMFI code space, so the NAV history mirror is
+    tried first; strategies launched too recently return n/a rather than a
+    figure stitched from a shorter window."""
+    out = {k: None for k in ("1M", "3M", "6M", "1Y", "SI", "Start")}
+    if not code:
+        return out
+    try:
+        j = requests.get(f"https://api.mfapi.in/mf/{code}", timeout=12,
+                         headers={"User-Agent": "Mozilla/5.0",
+                                  "Accept": "application/json"}).json()
+        pairs = {}
+        for x in (j.get("data") or []):
+            try:
+                pairs[pd.to_datetime(x["date"], format="%d-%m-%Y")] = float(x["nav"])
+            except (ValueError, TypeError, KeyError):
+                continue
+        if len(pairs) < 2:
+            return out
+        ser = pd.Series(pairs).sort_index()
+    except Exception:
+        return out
+    last, last_dt = float(ser.iloc[-1]), ser.index[-1]
+    first, first_dt = float(ser.iloc[0]), ser.index[0]
+    out["Start"] = first_dt.strftime("%d-%b-%Y")
+    if first > 0:
+        out["SI"] = _numv((last / first - 1) * 100)
+    for label, days in (("1M", 30), ("3M", 91), ("6M", 182), ("1Y", 365)):
+        past = ser[ser.index <= last_dt - pd.Timedelta(days=days)]
+        if past.empty:
+            continue
+        base = float(past.iloc[-1])
+        if base <= 0:
+            continue
+        out[label] = _numv((last / base - 1) * 100)
+    return out
+
+
 # ----------------------------------- etfs ----------------------------------
 # Symbol, display name, category. Symbols that return no history are dropped
 # at render time, so the list can carry newer launches safely.
@@ -2060,7 +2230,7 @@ live_every = 1
 
 # --- top nav: Screener / Stock OI / News ---
 _view_map = {"screener": "Screener", "custom": "Custom Screen",
-             "mf": "Mutual Funds", "etf": "ETFs",
+             "mf": "Mutual Funds", "etf": "ETFs", "sif": "SIF",
              "oi": "Stock OI", "news": "News"}
 _qp_view = str(st.query_params.get("view", "")).lower()
 if _qp_view in _view_map and "view" not in st.session_state:
@@ -2068,7 +2238,7 @@ if _qp_view in _view_map and "view" not in st.session_state:
 st.session_state.setdefault("view", "Screener")
 st.sidebar.markdown('<div class="nav-h">Sections</div>', unsafe_allow_html=True)
 view = st.sidebar.radio("view", ["Screener", "Stock OI", "Custom Screen", "ETFs",
-                                "Mutual Funds", "News"],
+                                "SIF", "Mutual Funds", "News"],
                         label_visibility="collapsed", key="view")
 st.sidebar.markdown('<div class="nav-foot">Collapse this panel with the arrow above. '
                     'Data is reference only — not investment advice.</div>',
@@ -2368,16 +2538,29 @@ if view == "Mutual Funds":
         st.stop()
     st.caption(f"{len(_mf):,} schemes from AMFI's official daily NAV file "
                f"(latest published {_mf['Date'].iloc[0]}). Returns come from each "
-               "scheme's own NAV history; over 1 year they are annualised.")
+               "scheme's own NAV history; over 1 year they are annualised. The tab "
+               "opens on Equity / Direct / Flexi Cap — widen the filters for more.")
+
+    def _opt_index(options: list[str], needle: str) -> int:
+        """First option containing `needle` — the tab opens on a narrow default
+        instead of loading every scheme AMFI publishes."""
+        for _i, _o in enumerate(options):
+            if needle.lower() in str(_o).lower():
+                return _i
+        return 0
 
     _f1 = st.columns([2, 2, 2.4, 1.6], gap="small")
-    _type = _f1[0].selectbox("Type", ["All types"] + sorted(_mf["Type"].unique()),
-                             key="mf_type")
+    _t_opts = ["All types"] + sorted(_mf["Type"].unique())
+    _type = _f1[0].selectbox("Type", _t_opts, key="mf_type",
+                             index=_opt_index(_t_opts, "equity"))
     _pool = _mf if _type == "All types" else _mf[_mf["Type"] == _type]
-    _amc = _f1[1].selectbox("Fund house", ["All fund houses"] + sorted(_pool["AMC"].unique()))
+    _amc = _f1[1].selectbox("Fund house", ["All fund houses"] + sorted(_pool["AMC"].unique()),
+                            key="mf_amc")
     if _amc != "All fund houses":
         _pool = _pool[_pool["AMC"] == _amc]
-    _cat = _f1[2].selectbox("Category", ["All categories"] + sorted(_pool["Category"].unique()))
+    _c_opts = ["All categories"] + sorted(_pool["Category"].unique())
+    _cat = _f1[2].selectbox("Category", _c_opts, key="mf_cat",
+                           index=_opt_index(_c_opts, "flexi cap"))
     if _cat != "All categories":
         _pool = _pool[_pool["Category"] == _cat]
     _q = _f1[3].text_input("Search scheme", key="mf_q", placeholder="e.g. flexi cap")
@@ -2386,7 +2569,7 @@ if view == "Mutual Funds":
 
     _o1 = st.columns([2, 2, 2.4, 1.6], gap="small")
     _plan = _o1[0].selectbox("Plan", ["Any plan", "Direct only", "Regular only"],
-                             key="mf_plan")
+                             index=1, key="mf_plan")
     if _plan == "Direct only":
         _pool = _pool[_pool["Scheme"].str.contains("direct", case=False, na=False)]
     elif _plan == "Regular only":
@@ -2539,6 +2722,136 @@ if view == "ETFs":
                    "not an index.")
 
     render_etf_tab()
+    st.markdown(f'<div class="disc"><strong>Disclaimer</strong> — {DISCLAIMER}</div>',
+                unsafe_allow_html=True)
+    st.stop()
+
+# ================================= SIF view ================================
+if view == "SIF":
+    st.markdown("### Specialized Investment Funds")
+    _sif, _sif_src = load_sifs()
+    if _sif.empty:
+        st.error("AMFI's SIF NAV feed is not answering from this host, so nothing is "
+                 "shown rather than stale or estimated values. SIF NAVs are published "
+                 "once every business evening — try again shortly. "
+                 f"Endpoints tried: {len(_SIF_NAV_URLS)}.")
+        st.caption("SIFs are SEBI's asset class between mutual funds and PMS, with a "
+                   "Rs 10 lakh minimum across all strategies of one fund. Their NAVs "
+                   "sit in AMFI's own SIF feed, separate from the mutual fund NAV file "
+                   "this app uses elsewhere.")
+        st.markdown(f'<div class="disc"><strong>Disclaimer</strong> — {DISCLAIMER}</div>',
+                    unsafe_allow_html=True)
+        st.stop()
+
+    _sdate = str(_sif["Date"].iloc[0]) if "Date" in _sif else ""
+    st.caption(f"{len(_sif):,} investment strategies with an AMFI-published NAV"
+               + (f" (latest {_sdate})" if _sdate else "")
+               + f" · source: {_sif_src}. Returns are computed from each strategy's own "
+                 "NAV history; every SIF launched from 2025 onward, so windows longer "
+                 "than the track record read n/a rather than being annualised.")
+
+    _s1 = st.columns([2.2, 2.2, 1.6, 1.8, 1.6], gap="small")
+    _s_houses = ["All fund houses"] + sorted(h for h in _sif["House"].unique() if h)
+    _shouse = _s1[0].selectbox("Fund house", _s_houses, key="sif_house")
+    _spool = _sif if _shouse == "All fund houses" else _sif[_sif["House"] == _shouse]
+    _s_strats = ["All strategies"] + sorted(_spool["Strategy"].unique())
+    _sstrat = _s1[1].selectbox("Strategy", _s_strats, key="sif_strat")
+    if _sstrat != "All strategies":
+        _spool = _spool[_spool["Strategy"] == _sstrat]
+    _splan = _s1[2].selectbox("Plan", ["Direct", "Regular", "Both"], key="sif_plan")
+    if _splan != "Both":
+        _spool = _spool[_spool["Plan"] == _splan]
+    _ssort = _s1[3].selectbox("Rank by", ["3M %", "1M %", "6M %", "1Y %",
+                                         "Since inception %", "NAV"], key="sif_sort")
+    _sq = _s1[4].text_input("Search", key="sif_q", placeholder="e.g. long-short")
+    if _sq and _sq.strip():
+        _m5 = _sq.strip()
+        _spool = _spool[_spool["Scheme"].str.contains(_m5, case=False, na=False)
+                        | _spool["House"].str.contains(_m5, case=False, na=False)]
+    _spool = _spool.reset_index(drop=True)
+
+    st.session_state.setdefault("sif_hist", {})
+    _s_codes = [c for c in _spool["Code"].head(60).tolist() if c]
+    _s_todo = [c for c in _s_codes if c not in st.session_state["sif_hist"]]
+    if _s_todo:
+        _sb = st.progress(0.0, text="Reading SIF NAV histories...")
+        for _i5, _c5 in enumerate(_s_todo):
+            st.session_state["sif_hist"][_c5] = sif_history(_c5)
+            _sb.progress((_i5 + 1) / len(_s_todo), text=f"Loaded {_i5 + 1}/{len(_s_todo)}")
+        _sb.empty()
+
+    _s_key = {"1M %": "1M", "3M %": "3M", "6M %": "6M", "1Y %": "1Y",
+              "Since inception %": "SI"}.get(_ssort)
+    def _s_metric(code):
+        if _s_key is None:
+            return None
+        return (st.session_state["sif_hist"].get(code) or {}).get(_s_key)
+    _spool["_Rank"] = ([_s_metric(c) for c in _spool["Code"]] if _s_key
+                       else _spool["NAV"].tolist())
+    _spool = _spool.sort_values("_Rank", ascending=False, na_position="last") \
+                   .reset_index(drop=True)
+
+    _sc = st.columns([3, 1.6], gap="small")
+    _sc[0].markdown(f"**{len(_spool)} strategies** listed, ranked by {_ssort.lower()}. "
+                    "Every SIF carries a Rs 10 lakh minimum investment per fund.")
+    _s_out = _spool.copy()
+    for _k5, _lab5 in (("1M", "1M %"), ("3M", "3M %"), ("6M", "6M %"),
+                       ("1Y", "1Y %"), ("SI", "Since inception %")):
+        _s_out[_lab5] = [(st.session_state["sif_hist"].get(c) or {}).get(_k5)
+                         for c in _s_out["Code"]]
+    _sc[1].download_button(
+        "⤓  Download", key="sif_dl",
+        data=df_to_excel_bytes(
+            _s_out[["Scheme", "House", "Strategy", "Plan", "Option", "NAV",
+                    "1M %", "3M %", "6M %", "1Y %", "Since inception %", "Date"]],
+            "SIF"),
+        file_name=f"SIF_{dt.date.today().isoformat()}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True)
+
+    _inav_note = ("AMFI's last declared NAV for this strategy, same source and "
+                  "cadence as the ETF tab's AMFI fallback — SIF units are not "
+                  "exchange-traded, so there is no intraday iNAV to refresh it")
+    _ter_note = ("AMFI's SIF NAV feed does not carry the expense ratio; each "
+                 "strategy's TER is disclosed in its ISID and monthly portfolio")
+    _s_heads = [("#", "r"), ("Investment strategy", "l"), ("SIF house", "l"),
+                ("Strategy type", "l"), ("Plan", "l"), ("Option", "l"),
+                ("NAV (Rs)", "r"), ("iNAV", "r"), ("1M %", "r"), ("3M %", "r"),
+                ("6M %", "r"), ("1Y %", "r"), ("Since inception %", "r"),
+                ("TER %", "r"), ("Live since", "l"), ("NAV date", "l")]
+    _s_rows = []
+    for _i6, _r6 in _spool.iterrows():
+        _h6 = st.session_state["sif_hist"].get(_r6["Code"]) or {}
+        _s_rows.append(
+            "<tr>"
+            f'<td class="c-num c-muted">{_i6 + 1}</td>'
+            f'<td style="white-space:normal;max-width:380px;font-weight:500">'
+            f'{_html.escape(str(_r6["Scheme"]))}</td>'
+            f'<td class="c-sec" style="color:{sector_color(_r6["House"])}">'
+            f'{_html.escape(str(_r6["House"]))}</td>'
+            f'<td class="c-muted" style="white-space:normal;max-width:220px">'
+            f'{_html.escape(str(_r6["Strategy"]))}</td>'
+            f'<td class="c-muted">{_html.escape(str(_r6["Plan"]))}</td>'
+            f'<td class="c-muted">{_html.escape(str(_r6["Option"]))}</td>'
+            f'<td class="c-num">{fmt_val(_r6["NAV"], 4)}</td>'
+            f'<td class="c-num" title="{_html.escape(_inav_note, quote=True)} '
+            f'({_html.escape(str(_r6["Date"]), quote=True)})">'
+            f'{fmt_val(_r6["NAV"], 4)}</td>'
+            + signed_cell(_h6.get("1M")) + signed_cell(_h6.get("3M"))
+            + signed_cell(_h6.get("6M")) + signed_cell(_h6.get("1Y"))
+            + signed_cell(_h6.get("SI"))
+            + f'<td class="c-num c-muted" title="{_html.escape(_ter_note, quote=True)}">n/a</td>'
+            + f'<td class="c-date">{_html.escape(str(_h6.get("Start") or "—"))}</td>'
+            + f'<td class="c-date">{_html.escape(str(_r6["Date"]))}</td>'
+            "</tr>")
+    st.markdown(sh_table(_s_heads, _s_rows), unsafe_allow_html=True)
+    st.caption("iNAV shows AMFI's last declared NAV — the same fallback the ETF tab "
+               "uses when no intraday feed is reachable; hover it for the date. "
+               "Rank is the position under the metric selected above, over the "
+               "strategies currently filtered — not a rating. SIF strategies use "
+               "derivatives and short positions and are a distinct risk class from "
+               "mutual funds; read the ISID, SID and KIM before investing. Hover the "
+               "iNAV and TER cells for why those figures are not published in this feed.")
     st.markdown(f'<div class="disc"><strong>Disclaimer</strong> — {DISCLAIMER}</div>',
                 unsafe_allow_html=True)
     st.stop()
