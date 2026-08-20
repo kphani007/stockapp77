@@ -1572,11 +1572,26 @@ def _parse_sif_html(body: str) -> list[dict]:
 
 
 def _parse_sif_excel(content: bytes) -> list[dict]:
-    """AMFI's SIF NAV Excel download - a real .xlsx, not text."""
+    """AMFI's SIF NAV Excel download - a real .xlsx, but AMFI exports often
+    carry a title/blank row above the real header, so the header row is
+    located by content rather than assumed to be row 0."""
     try:
-        df = pd.read_excel(io.BytesIO(content), engine="openpyxl")
+        raw = pd.read_excel(io.BytesIO(content), engine="openpyxl", header=None)
     except Exception:
         return []
+    header_row = None
+    for i in range(min(10, len(raw))):
+        vals = [str(v).strip().lower() for v in raw.iloc[i].tolist()]
+        if any("nav" in v for v in vals) and any(
+                ("scheme" in v or "strateg" in v or "investment approach" in v)
+                for v in vals):
+            header_row = i
+            break
+    if header_row is None:
+        return []
+    df = raw.iloc[header_row + 1:].copy()
+    df.columns = [str(c).strip() for c in raw.iloc[header_row].tolist()]
+    df = df.dropna(how="all")
     cols = {str(c).strip().lower(): c for c in df.columns}
     nav_c = next((v for k, v in cols.items() if "nav" in k and "date" not in k), None)
     name_c = next((v for k, v in cols.items()
