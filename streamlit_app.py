@@ -1579,10 +1579,13 @@ def _parse_sif_excel(content: bytes) -> list[dict]:
         raw = pd.read_excel(io.BytesIO(content), engine="openpyxl", header=None)
     except Exception:
         return []
+    def _has_nav(v: str) -> bool:
+        return "nav" in v or "net asset value" in v
+
     header_row = None
     for i in range(min(10, len(raw))):
         vals = [str(v).strip().lower() for v in raw.iloc[i].tolist()]
-        if any("nav" in v for v in vals) and any(
+        if any(_has_nav(v) for v in vals) and any(
                 ("scheme" in v or "strateg" in v or "investment approach" in v)
                 for v in vals):
             header_row = i
@@ -1593,7 +1596,7 @@ def _parse_sif_excel(content: bytes) -> list[dict]:
     df.columns = [str(c).strip() for c in raw.iloc[header_row].tolist()]
     df = df.dropna(how="all")
     cols = {str(c).strip().lower(): c for c in df.columns}
-    nav_c = next((v for k, v in cols.items() if "nav" in k and "date" not in k), None)
+    nav_c = next((v for k, v in cols.items() if _has_nav(k) and "date" not in k), None)
     name_c = next((v for k, v in cols.items()
                    if "scheme" in k or "strateg" in k or "investment approach" in k), None)
     if nav_c is None or name_c is None:
@@ -1711,6 +1714,8 @@ def load_sifs() -> tuple[pd.DataFrame, str, list[str]]:
                 continue
             if content[:2] == b"PK" or "download-excel" in url:
                 rows = _parse_sif_excel(content)
+                if not rows:
+                    tried[-1] += " (downloaded, but no header row with a NAV + scheme/strategy column was found)"
             else:
                 body = content.decode("utf-8", errors="ignore")
                 rows = (_parse_amfi_semicolon(body) if ";" in body[:4000]
