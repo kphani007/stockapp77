@@ -1571,6 +1571,40 @@ def _parse_sif_html(body: str) -> list[dict]:
     return []
 
 
+def _parse_sif_excel(content: bytes) -> list[dict]:
+    """AMFI's SIF NAV Excel download - a real .xlsx, not text."""
+    try:
+        df = pd.read_excel(io.BytesIO(content), engine="openpyxl")
+    except Exception:
+        return []
+    cols = {str(c).strip().lower(): c for c in df.columns}
+    nav_c = next((v for k, v in cols.items() if "nav" in k and "date" not in k), None)
+    name_c = next((v for k, v in cols.items()
+                   if "scheme" in k or "strateg" in k or "investment approach" in k), None)
+    if nav_c is None or name_c is None:
+        return []
+    date_c = next((v for k, v in cols.items() if "date" in k), None)
+    house_c = next((v for k, v in cols.items()
+                    if "amc" in k or "fund house" in k or ("house" in k)), None)
+    isin_c = next((v for k, v in cols.items() if "isin" in k), None)
+    cat_c = next((v for k, v in cols.items() if "categ" in k or "strateg" in k), None)
+    out = []
+    for _, r in df.iterrows():
+        try:
+            nav = float(str(r[nav_c]).replace(",", ""))
+        except (ValueError, TypeError):
+            continue
+        if nav <= 0:
+            continue
+        out.append({"Code": "", "Scheme": str(r[name_c]).strip(),
+                    "House": (str(r[house_c]).strip() if house_c is not None else ""),
+                    "Category": (str(r[cat_c]).strip() if cat_c is not None else ""),
+                    "ISIN": (str(r[isin_c]).strip() if isin_c is not None else ""),
+                    "NAV": round(nav, 4),
+                    "Date": (str(r[date_c]).strip() if date_c is not None else "")})
+    return out
+
+
 def _sif_rows_from_amfi_all() -> list[dict]:
     """SIF blocks inside AMFI's complete NAV report, identified by their own
     scheme-type header rather than by any hardcoded fund name."""
@@ -1656,14 +1690,18 @@ def load_sifs() -> tuple[pd.DataFrame, str, list[str]]:
             r = requests.get(url, timeout=20,
                              headers={"User-Agent": "Mozilla/5.0",
                                       "Accept": "text/html,text/plain,*/*"})
-            body = r.text or ""
-            tried.append(f"{url} — HTTP {r.status_code}, {len(body):,} bytes")
-            if r.status_code != 200 or len(body) < 40:
+            content = r.content or b""
+            tried.append(f"{url} — HTTP {r.status_code}, {len(content):,} bytes")
+            if r.status_code != 200 or len(content) < 40:
                 continue
-            rows = (_parse_amfi_semicolon(body) if ";" in body[:4000]
-                    else _parse_sif_html(body))
-            if not rows and "<table" in body.lower():
-                rows = _parse_sif_html(body)
+            if content[:2] == b"PK" or "download-excel" in url:
+                rows = _parse_sif_excel(content)
+            else:
+                body = content.decode("utf-8", errors="ignore")
+                rows = (_parse_amfi_semicolon(body) if ";" in body[:4000]
+                        else _parse_sif_html(body))
+                if not rows and "<table" in body.lower():
+                    rows = _parse_sif_html(body)
             if rows:
                 return _finish(rows, url)
         except Exception as exc:
