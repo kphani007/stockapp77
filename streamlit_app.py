@@ -1455,17 +1455,32 @@ def mf_returns(code: str) -> dict:
 
 
 # ------------------- specialized investment funds (SIF) --------------------
-# SEBI's asset class between mutual funds and PMS (Rs 10 lakh minimum). AMFI
-# publishes SIF NAVs in its own daily feed, separate from NAVAll.txt, and the
-# endpoint has moved more than once - so try the known forms in order and say
-# on the tab which one answered. Nothing is invented when they all fail.
+# SEBI's asset class between mutual funds and PMS (Rs 10 lakh minimum). All of
+# it is free, public AMFI data, but it is served from more than one place and
+# the SIF-only file is the least stable of them - so three sources are tried in
+# order of directness and the tab reports what each one answered:
+#   1. AMFI's SIF-only NAV text/excel endpoints (portal first, www second)
+#   2. AMFI's complete NAV report, where SIF blocks carry their own header
+#   3. mfapi.in, which mirrors the same AMFI scheme-code space
+# Nothing is invented when all three fail.
 _SIF_NAV_URLS = (
     "https://portal.amfiindia.com/spages/SIFNAVAll.txt",
-    "https://www.amfiindia.com/spages/SIFNAVAll.txt",
     "https://portal.amfiindia.com/spages/SIFNAV.txt",
+    "https://www.amfiindia.com/spages/SIFNAVAll.txt",
     "https://www.amfiindia.com/api/download-excel/sif-latest-nav",
-    "https://www.amfiindia.com/sif/latest-nav",
 )
+_AMFI_ALL_URLS = ("https://portal.amfiindia.com/spages/NAVAll.txt",
+                  "https://www.amfiindia.com/spages/NAVAll.txt")
+_SIF_QUERIES = ("specialized investment fund", "specialised investment fund",
+                "long short", "long-short", "sector rotation",
+                "ex-top 100", "asset allocator")
+_SIF_MARKERS = ("specialized investment fund", "specialised investment fund",
+                "specialized investment", "specialised investment")
+
+
+def _is_sif(text: str) -> bool:
+    t = (text or "").lower()
+    return any(m in t for m in _SIF_MARKERS)
 
 
 def _sif_plan(name: str) -> str:
@@ -1500,7 +1515,7 @@ def _sif_strategy(category: str, name: str) -> str:
 def _parse_amfi_semicolon(text: str) -> list[dict]:
     """AMFI's block text format: house / category headers, then
     code;isin;isin;scheme;nav;date rows."""
-    rows, house, cat = [], "", ""
+    rows, house, house_raw, cat = [], "", "", ""
     for raw in text.splitlines():
         line = raw.strip()
         if not line:
@@ -1510,6 +1525,7 @@ def _parse_amfi_semicolon(text: str) -> list[dict]:
                 cat = line[line.find("(") + 1:line.rfind(")")].strip() or line
             else:
                 cat = cat if line.lower().startswith("scheme") else cat
+                house_raw = line
                 house = line.replace("Specialized Investment Fund", "").strip() or house
             continue
         parts = [p.strip() for p in line.split(";")]
@@ -1520,7 +1536,8 @@ def _parse_amfi_semicolon(text: str) -> list[dict]:
         except (ValueError, IndexError):
             continue
         rows.append({"Code": parts[0], "Scheme": parts[3], "House": house,
-                     "Category": cat, "NAV": round(nav, 4), "Date": parts[5]})
+                     "HouseRaw": house_raw, "Category": cat,
+                     "ISIN": parts[1], "NAV": round(nav, 4), "Date": parts[5]})
     return rows
 
 
@@ -1554,34 +1571,114 @@ def _parse_sif_html(body: str) -> list[dict]:
     return []
 
 
+def _sif_rows_from_amfi_all() -> list[dict]:
+    """SIF blocks inside AMFI's complete NAV report, identified by their own
+    scheme-type header rather than by any hardcoded fund name."""
+    for url in _AMFI_ALL_URLS:
+        try:
+            body = requests.get(url, timeout=30,
+                                headers={"User-Agent": "Mozilla/5.0"}).text or ""
+        except Exception:
+            continue
+        if len(body) < 5000:
+            continue
+        rows = [r for r in _parse_amfi_semicolon(body)
+                if _is_sif(f'{r.get("HouseRaw", "")} {r["Category"]} {r["Scheme"]}')]
+        if rows:
+            return rows
+    return []
+
+
+def _sif_rows_from_mfapi() -> list[dict]:
+    """Last resort: mfapi.in mirrors AMFI's scheme-code space, so SIF strategies
+    are discoverable by strategy wording and then confirmed on the scheme's own
+    AMFI scheme type before being shown."""
+    hits, seen = [], set()
+    for q in _SIF_QUERIES:
+        try:
+            res = requests.get("https://api.mfapi.in/mf/search", params={"q": q},
+                               timeout=12,
+                               headers={"User-Agent": "Mozilla/5.0",
+                                        "Accept": "application/json"}).json()
+        except Exception:
+            continue
+        for it in (res or [])[:60]:
+            code = str(it.get("schemeCode") or "")
+            if code and code not in seen:
+                seen.add(code)
+                hits.append((code, str(it.get("schemeName") or "")))
+    out = []
+    for code, name in hits[:150]:
+        try:
+            j = requests.get(f"https://api.mfapi.in/mf/{code}/latest", timeout=10,
+                             headers={"User-Agent": "Mozilla/5.0",
+                                      "Accept": "application/json"}).json()
+        except Exception:
+            continue
+        meta = j.get("meta") or {}
+        if not _is_sif(f'{meta.get("scheme_type", "")} {meta.get("scheme_category", "")} '
+                       f'{meta.get("fund_house", "")}'):
+            continue
+        d = (j.get("data") or [{}])[0]
+        try:
+            nav = float(d.get("nav"))
+        except (TypeError, ValueError):
+            continue
+        out.append({"Code": code, "Scheme": name,
+                    "House": str(meta.get("fund_house") or "")
+                             .replace("Specialized Investment Fund", "")
+                             .replace("Mutual Fund", "").strip(),
+                    "Category": str(meta.get("scheme_category") or ""),
+                    "ISIN": str(meta.get("isin_growth") or ""),
+                    "NAV": round(nav, 4), "Date": str(d.get("date") or "")})
+    return out
+
+
 @st.cache_data(ttl=10800, show_spinner=False)
-def load_sifs() -> tuple[pd.DataFrame, str]:
-    """Every SIF investment strategy AMFI publishes a NAV for. Returns
-    (rows, the endpoint that answered) - empty frame if none did."""
+def load_sifs() -> tuple[pd.DataFrame, str, list[str]]:
+    """Every SIF investment strategy with a published AMFI NAV. Returns
+    (rows, the source that answered, a line per source tried)."""
+    tried: list[str] = []
+
+    def _finish(rows, src):
+        df = pd.DataFrame(rows)
+        if "ISIN" not in df.columns:
+            df["ISIN"] = ""
+        df["House"] = df["House"].replace("", pd.NA).fillna("-")
+        df["Plan"] = df["Scheme"].map(_sif_plan)
+        df["Option"] = df["Scheme"].map(_sif_option)
+        df["Strategy"] = [_sif_strategy(c, n)
+                          for c, n in zip(df["Category"], df["Scheme"])]
+        return df.reset_index(drop=True), src, tried
+
     for url in _SIF_NAV_URLS:
         try:
             r = requests.get(url, timeout=20,
                              headers={"User-Agent": "Mozilla/5.0",
                                       "Accept": "text/html,text/plain,*/*"})
             body = r.text or ""
+            tried.append(f"{url} — HTTP {r.status_code}, {len(body):,} bytes")
             if r.status_code != 200 or len(body) < 40:
                 continue
             rows = (_parse_amfi_semicolon(body) if ";" in body[:4000]
                     else _parse_sif_html(body))
             if not rows and "<table" in body.lower():
                 rows = _parse_sif_html(body)
-            if not rows:
-                continue
-            df = pd.DataFrame(rows)
-            df["House"] = df["House"].replace("", pd.NA).fillna("-")
-            df["Plan"] = df["Scheme"].map(_sif_plan)
-            df["Option"] = df["Scheme"].map(_sif_option)
-            df["Strategy"] = [_sif_strategy(c, n)
-                              for c, n in zip(df["Category"], df["Scheme"])]
-            return df.reset_index(drop=True), url
-        except Exception:
-            continue
-    return pd.DataFrame(), ""
+            if rows:
+                return _finish(rows, url)
+        except Exception as exc:
+            tried.append(f"{url} — {type(exc).__name__}")
+
+    rows = _sif_rows_from_amfi_all()
+    tried.append(f"AMFI complete NAV report — {len(rows)} SIF rows found")
+    if rows:
+        return _finish(rows, "AMFI complete NAV report (SIF blocks)")
+
+    rows = _sif_rows_from_mfapi()
+    tried.append(f"mfapi.in AMFI mirror — {len(rows)} SIF rows found")
+    if rows:
+        return _finish(rows, "mfapi.in (AMFI scheme-code mirror)")
+    return pd.DataFrame(), "", tried
 
 
 @st.cache_data(ttl=10800, show_spinner=False)
@@ -2729,12 +2826,17 @@ if view == "ETFs":
 # ================================= SIF view ================================
 if view == "SIF":
     st.markdown("### Specialized Investment Funds")
-    _sif, _sif_src = load_sifs()
+    _sif, _sif_src, _sif_tried = load_sifs()
     if _sif.empty:
         st.error("AMFI's SIF NAV feed is not answering from this host, so nothing is "
                  "shown rather than stale or estimated values. SIF NAVs are published "
-                 "once every business evening — try again shortly. "
-                 f"Endpoints tried: {len(_SIF_NAV_URLS)}.")
+                 "once every business evening — try again shortly.")
+        with st.expander("What was tried"):
+            for _t5 in _sif_tried:
+                st.markdown(f"- `{_t5}`")
+            st.caption("All of these are free, public AMFI sources — no key or "
+                       "subscription. A failure here is the endpoint refusing this "
+                       "host, not a paywall.")
         st.caption("SIFs are SEBI's asset class between mutual funds and PMS, with a "
                    "Rs 10 lakh minimum across all strategies of one fund. Their NAVs "
                    "sit in AMFI's own SIF feed, separate from the mutual fund NAV file "
@@ -2802,7 +2904,7 @@ if view == "SIF":
     _sc[1].download_button(
         "⤓  Download", key="sif_dl",
         data=df_to_excel_bytes(
-            _s_out[["Scheme", "House", "Strategy", "Plan", "Option", "NAV",
+            _s_out[["Scheme", "House", "Strategy", "Plan", "Option", "ISIN", "NAV",
                     "1M %", "3M %", "6M %", "1Y %", "Since inception %", "Date"]],
             "SIF"),
         file_name=f"SIF_{dt.date.today().isoformat()}.xlsx",
@@ -2818,7 +2920,7 @@ if view == "SIF":
                 ("Strategy type", "l"), ("Plan", "l"), ("Option", "l"),
                 ("NAV (Rs)", "r"), ("iNAV", "r"), ("1M %", "r"), ("3M %", "r"),
                 ("6M %", "r"), ("1Y %", "r"), ("Since inception %", "r"),
-                ("TER %", "r"), ("Live since", "l"), ("NAV date", "l")]
+                ("TER %", "r"), ("ISIN", "l"), ("Live since", "l"), ("NAV date", "l")]
     _s_rows = []
     for _i6, _r6 in _spool.iterrows():
         _h6 = st.session_state["sif_hist"].get(_r6["Code"]) or {}
@@ -2841,6 +2943,8 @@ if view == "SIF":
             + signed_cell(_h6.get("6M")) + signed_cell(_h6.get("1Y"))
             + signed_cell(_h6.get("SI"))
             + f'<td class="c-num c-muted" title="{_html.escape(_ter_note, quote=True)}">n/a</td>'
+            + f'<td class="c-muted" style="font-size:11px">'
+            f'{_html.escape(str(_r6.get("ISIN") or "—"))}</td>'
             + f'<td class="c-date">{_html.escape(str(_h6.get("Start") or "—"))}</td>'
             + f'<td class="c-date">{_html.escape(str(_r6["Date"]))}</td>'
             "</tr>")
