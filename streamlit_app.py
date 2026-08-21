@@ -51,13 +51,13 @@ NIFTY50 = [
 
 HEADERS = [
     "Date", "Stock Symbol", "Sector", "Current Price (Rs)", "Volume",
-    "RSI", "VWAP", "PE", "Sec PE", "Buy/Sell", "52 Week High (Rs)", "1 Year Target (Rs)",
+    "RSI", "PEG", "VWAP", "PE", "Sec PE", "Buy/Sell", "52 Week High (Rs)", "1 Year Target (Rs)",
 ]
 
 COL_LABELS = {
     "Date": "Date", "Stock Symbol": "Stock Symbol", "Sector": "Sector",
     "Current Price (Rs)": "Current Price", "Volume": "Volume", "RSI": "RSI",
-    "VWAP": "VWAP", "PE": "PE", "Sec PE": "Sec PE",
+    "PEG": "PEG", "VWAP": "VWAP", "PE": "PE", "Sec PE": "Sec PE",
     "Buy/Sell": "Buy/Sell", "52 Week High (Rs)": "52 Week High",
     "1 Year Target (Rs)": "1 Year Forecast",
 }
@@ -873,8 +873,14 @@ def fetch_fundamentals(symbol: str) -> dict:
         pev = info.get("trailingPE")
         if pev:
             pe = round(float(pev), 2)
+        peg = info.get("pegRatio") or info.get("trailingPegRatio")
+        if not peg and pev:
+            eg = info.get("earningsGrowth")
+            if eg:
+                peg = float(pev) / (float(eg) * 100)
+        peg = round(float(peg), 2) if peg else None
     except Exception:
-        pass
+        peg = None
     if target == "n/a":
         try:
             m = (tk.analyst_price_targets or {}).get("mean")
@@ -882,7 +888,7 @@ def fetch_fundamentals(symbol: str) -> dict:
                 target = round(float(m), 2)
         except Exception:
             pass
-    return {"name": name, "sector": sector, "reco": reco, "target": target, "pe": pe}
+    return {"name": name, "sector": sector, "reco": reco, "target": target, "pe": pe, "peg": peg}
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -1068,7 +1074,7 @@ def scan(tickers: tuple[str, ...], threshold: float, fetch_fund_limit: int) -> p
             bar.progress((idx + 1) / max(total, 1), text=f"Loaded {idx+1}/{total}")
         else:
             f = {"name": sym.replace(".NS", ""), "sector": "not loaded",
-                 "reco": "not loaded", "target": "not loaded", "pe": None}
+                 "reco": "not loaded", "target": "not loaded", "pe": None, "peg": None}
         cser = close_map.get(sym)
         _vw = compute_vwap(cser, volser_map.get(sym))
         _vwap_pos = ("Above" if price > _vw else "Below") if _vw else "n/a"
@@ -1081,6 +1087,7 @@ def scan(tickers: tuple[str, ...], threshold: float, fetch_fund_limit: int) -> p
             "Volume": vol_map.get(sym),
             "52 Week High (Rs)": round(high52, 2) if high52 else None,
             "RSI": round(rsi, 1),
+            "PEG": f.get("peg"),
             "VWAP": _vwap_pos,
             "PE": f.get("pe"),
             "Sec PE": None,
@@ -2074,6 +2081,7 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
         if isinstance(vcell.value, (int, float)):
             vcell.number_format = "#,##0"
         ws.cell(row=i, column=col_of["RSI"]).number_format = "0.0"
+        ws.cell(row=i, column=col_of["PEG"]).number_format = "0.00"
         if isinstance(r["RSI"], (int, float)) and r["RSI"] >= 70:
             for cell in ws[i]:
                 cell.fill = hot
@@ -2370,7 +2378,7 @@ def _open_in_screener(sym: str) -> None:
     st.session_state["results"] = scan((f"{_sy}.NS",), 0.0, 1)
     st.session_state["scanned"] = 1
     st.session_state["threshold"] = 0
-    st.session_state["view"] = "Screener"
+    st.session_state["_pending_view"] = "Screener"
     st.session_state.pop("qp_opened", None)
     if "stock" in st.query_params:
         del st.query_params["stock"]
@@ -2390,6 +2398,8 @@ _view_map = {"screener": "Screener", "custom": "Custom Screen",
 _qp_view = str(st.query_params.get("view", "")).lower()
 if _qp_view in _view_map and "view" not in st.session_state:
     st.session_state["view"] = _view_map[_qp_view]
+if "_pending_view" in st.session_state:
+    st.session_state["view"] = st.session_state.pop("_pending_view")
 st.session_state.setdefault("view", "Screener")
 st.sidebar.markdown('<div class="nav-h">Sections</div>', unsafe_allow_html=True)
 view = st.sidebar.radio("view", ["Screener", "Stock OI", "Custom Screen", "ETFs",
@@ -3140,7 +3150,7 @@ else:
     def _fmt(x):
         return f"{x:,.2f}" if isinstance(x, (int, float)) else str(x)
 
-    aligns = ["l", "l", "l", "r", "r", "r", "c", "r", "r", "c", "r", "r"]
+    aligns = ["l", "l", "l", "r", "r", "r", "r", "c", "r", "r", "c", "r", "r"]
     _hpairs = list(zip(HEADERS, aligns))
     _pi = [h for h, _a in _hpairs].index("Current Price (Rs)")
     _hpairs.insert(_pi, ("Trend", "c"))
@@ -3154,6 +3164,8 @@ else:
         rsi = r["RSI"]
         reco = r["Buy/Sell"]
         rsi_txt = f"{rsi:.1f}" if isinstance(rsi, (int, float)) else str(rsi)
+        peg = r.get("PEG")
+        peg_txt = f"{peg:.2f}" if isinstance(peg, (int, float)) else "n/a"
         href = f"?scan={_cfgq}&stock={sym}" if _cfgq else f"?stock={sym}"
         _sv = lambda v: f"{v:,.2f}" if isinstance(v, (int, float)) else "n/a"
         _vol = lambda v: f"{int(v):,}" if isinstance(v, (int, float)) else "n/a"
@@ -3173,6 +3185,7 @@ else:
             f'<td class="c-num c-price" title="{sma_tip}">{_fmt(r["Current Price (Rs)"])}</td>'
             f'<td class="c-num c-muted">{_vol(r.get("Volume"))}</td>'
             f'<td class="c-num c-rsi" style="color:{rsi_color(rsi)}">{rsi_txt}</td>'
+            f'<td class="c-num c-muted">{peg_txt}</td>'
             f'<td class="c-vwap" title="{_vw_tip}" style="text-align:center;font-weight:600;'
             f'color:{"#0B7A4B" if r["VWAP"]=="Above" else "#B3261E" if r["VWAP"]=="Below" else "#5E6E7E"}">'
             f'{r["VWAP"]}</td>'
