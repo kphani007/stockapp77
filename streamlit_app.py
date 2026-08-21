@@ -1583,19 +1583,24 @@ def _parse_sif_excel(content: bytes) -> list[dict]:
     carry a title/blank row above the real header, so the header row is
     located by content rather than assumed to be row 0."""
     try:
-        raw = pd.read_excel(io.BytesIO(content), engine="openpyxl", header=None)
+        sheets = pd.read_excel(io.BytesIO(content), engine="openpyxl", header=None,
+                               sheet_name=None)
     except Exception:
         return []
     def _has_nav(v: str) -> bool:
         return "nav" in v or "net asset value" in v
 
-    header_row = None
-    for i in range(min(10, len(raw))):
-        vals = [str(v).strip().lower() for v in raw.iloc[i].tolist()]
-        if any(_has_nav(v) for v in vals) and any(
-                ("scheme" in v or "strateg" in v or "investment approach" in v)
-                for v in vals):
-            header_row = i
+    raw, header_row = None, None
+    for _sheet in sheets.values():
+        for i in range(min(30, len(_sheet))):
+            vals = [str(v).strip().lower() for v in _sheet.iloc[i].tolist()]
+            if any(_has_nav(v) for v in vals) and any(
+                    ("scheme" in v or "strateg" in v or "investment approach" in v
+                     or "fund" in v or "plan" in v)
+                    for v in vals):
+                raw, header_row = _sheet, i
+                break
+        if header_row is not None:
             break
     if header_row is None:
         return []
