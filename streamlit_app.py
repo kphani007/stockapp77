@@ -1040,7 +1040,7 @@ def scan(tickers: tuple[str, ...], threshold: float, fetch_fund_limit: int) -> p
                            auto_adjust=False, threads=True, progress=False)
         for sym in chunk:
             try:
-                df = data[sym] if len(chunk) > 1 else data
+                df = data[sym] if isinstance(data.columns, pd.MultiIndex) else data
                 c = df["Close"].dropna()
                 if c.empty:
                     continue
