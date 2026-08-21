@@ -1608,27 +1608,58 @@ def _parse_sif_excel(content: bytes) -> list[dict]:
     df.columns = [str(c).strip() for c in raw.iloc[header_row].tolist()]
     df = df.dropna(how="all")
     cols = {str(c).strip().lower(): c for c in df.columns}
-    nav_c = next((v for k, v in cols.items() if _has_nav(k) and "date" not in k), None)
+    # name column: prefer an explicit "...name..." or "scheme" header over a
+    # generic fund/plan match, and never let the NAV-name column double as
+    # the NAV-value column below.
     name_c = next((v for k, v in cols.items()
-                   if "scheme" in k or "strateg" in k or "investment approach" in k), None)
+                   if "name" in k or "scheme" in k or "investment approach" in k), None)
+    nav_c = next((v for k, v in cols.items()
+                  if _has_nav(k) and "date" not in k and v != name_c), None)
+    if name_c is None:
+        name_c = next((v for k, v in cols.items() if "strateg" in k or "fund" in k), None)
     if nav_c is None or name_c is None:
         return []
+    code_c = next((v for k, v in cols.items() if "code" in k), None)
     date_c = next((v for k, v in cols.items() if "date" in k), None)
     house_c = next((v for k, v in cols.items()
                     if "amc" in k or "fund house" in k or ("house" in k)), None)
     isin_c = next((v for k, v in cols.items() if "isin" in k), None)
-    cat_c = next((v for k, v in cols.items() if "categ" in k or "strateg" in k), None)
+    cat_c = next((v for k, v in cols.items() if "categ" in k), None)
+    plan_c = next((v for k, v in cols.items() if k == "plan" or "plan" in k), None)
+    opt_c = next((v for k, v in cols.items() if "option" in k or k == "opt"), None)
+
+    # AMFI's SIF sheet groups rows under bold section headers with no code
+    # value: a broad category ("Open Ended Scheme (...)") then, nested under
+    # it, the SIF house name ("Altiva SIF"). Neither is its own column, so
+    # they're carried forward onto the data rows that follow them.
+    cur_house, cur_category = "", ""
     out = []
     for _, r in df.iterrows():
+        code_val = str(r[code_c]).strip() if code_c is not None else ""
+        name_val = str(r[name_c]).strip() if name_c is not None else ""
+        nav_raw = str(r[nav_c]).strip() if nav_c is not None else ""
+        is_data_row = bool(re.match(r"^[A-Za-z]+-?\d+$", code_val)) if code_val else False
+        if not is_data_row:
+            label = next((str(v).strip() for v in r.tolist()
+                         if str(v).strip() and str(v).strip().lower() != "nan"), "")
+            if label:
+                if "scheme" in label.lower() or "(" in label:
+                    cur_category = label
+                else:
+                    cur_house = label
+            continue
         try:
-            nav = float(str(r[nav_c]).replace(",", ""))
+            nav = float(nav_raw.replace(",", ""))
         except (ValueError, TypeError):
             continue
         if nav <= 0:
             continue
-        out.append({"Code": "", "Scheme": str(r[name_c]).strip(),
-                    "House": (str(r[house_c]).strip() if house_c is not None else ""),
-                    "Category": (str(r[cat_c]).strip() if cat_c is not None else ""),
+        plan = str(r[plan_c]).strip() if plan_c is not None else ""
+        opt = str(r[opt_c]).strip() if opt_c is not None else ""
+        out.append({"Code": code_val, "Scheme": name_val,
+                    "House": cur_house,
+                    "Category": (str(r[cat_c]).strip() if cat_c is not None else cur_category),
+                    "Plan": plan, "Option": opt,
                     "ISIN": (str(r[isin_c]).strip() if isin_c is not None else ""),
                     "NAV": round(nav, 4),
                     "Date": (str(r[date_c]).strip() if date_c is not None else "")})
