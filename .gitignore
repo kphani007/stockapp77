@@ -20,3 +20,7 @@ env/
 Thumbs.db
 .vscode/
 .idea/
+
+# --- runtime data ---
+visitor_stats.json
+.pytest_cache/
