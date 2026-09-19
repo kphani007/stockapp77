@@ -31,6 +31,15 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from stockmerit.features import fundamentals as merit_fundamentals
+from stockmerit.features import relative_strength as merit_rs
+from stockmerit.features import trend as merit_trend
+from stockmerit.features import volatility as merit_volatility
+from stockmerit.features import volume as merit_volume
+from stockmerit.features.momentum import rolling_rsi
+from stockmerit.scoring import backtest as merit_backtest
+from stockmerit.scoring.merit_score import MeritComponents, compute_merit_score
+
 RSI_PERIOD = 14
 FUND_LIMIT = 100
 MCAP_LARGE_CR, MCAP_MID_CR, MCAP_SMALL_CR = 20000, 5000, 500
@@ -1147,6 +1156,10 @@ NUM_COLS = [
     ("AvgVol20", "Avg volume (20d)", "T", 0),
     ("VolX", "Volume vs avg (x)", "T", 2),
     ("ATRpct", "ATR 14 %", "T", 2),
+    ("RS", "Relative strength vs NIFTY (0-100)", "T", 1),
+    ("BBSqueeze", "Bollinger squeeze (0-100)", "T", 1),
+    ("VolTrend", "Volume trend (0-100)", "T", 1),
+    ("AccumScore", "Accumulation (0-100)", "T", 1),
     ("MCapCr", "Market cap (Rs cr)", "F", 0),
     ("PE", "P/E", "F", 2),
     ("FwdPE", "Forward P/E", "F", 2),
@@ -1164,6 +1177,12 @@ NUM_COLS = [
     ("Beta", "Beta", "F", 2),
     ("Target", "1Y target (Rs)", "F", 2),
     ("Upside", "Upside to target %", "F", 2),
+    ("PEG", "PEG ratio", "F", 2),
+    ("PEGScore", "PEG score (0-100)", "F", 1),
+    ("EarnAccel", "Earnings acceleration (0-100)", "F", 1),
+    ("CFOQuality", "Cash flow quality (0-100)", "F", 1),
+    ("SectorRS", "Sector strength (0-100)", "F", 1),
+    ("MeritScore", "MERIT SCORE (0-100)", "F", 1),
 ]
 COL_META = {c: (lab, grp, dp) for c, lab, grp, dp in NUM_COLS}
 COL_META["iNAV"] = ("iNAV (Rs)", "T", 2)      # ETF-only, not a stock screen filter
@@ -1220,6 +1239,39 @@ def bulk_ohlcv(tickers: tuple[str, ...], bucket: int = 0) -> dict:
     return out
 
 
+BENCHMARK_SYMBOL = "^NSEI"  # NIFTY 50 index, used for relative-strength / market-regime scoring
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def benchmark_ohlcv(bucket: int = 0) -> dict:
+    """1-year daily OHLCV for the NSE benchmark index. Empty dict on failure --
+    callers treat that the same as "not available" rather than raising."""
+    try:
+        df = yf.Ticker(BENCHMARK_SYMBOL).history(period="1y", interval="1d", auto_adjust=False)
+        if df is None or df.empty:
+            return {}
+        return {"close": df["Close"].dropna(), "high": df["High"].dropna(),
+                "low": df["Low"].dropna(), "vol": df["Volume"].dropna()}
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def signal_backtest_history(symbol: str, period: str = "3y") -> dict:
+    """Standalone price history for one symbol, used by the Signal Backtest
+    panel -- kept separate from bulk_ohlcv since it needs more years of data
+    than the screener's 1y window to find enough historical signal dates."""
+    sym = symbol if symbol.upper().endswith(".NS") else f"{symbol.upper()}.NS"
+    try:
+        df = yf.Ticker(sym).history(period=period, interval="1d", auto_adjust=False)
+        if df is None or df.empty:
+            return {}
+        return {"close": df["Close"].dropna(), "high": df["High"].dropna(),
+                "low": df["Low"].dropna()}
+    except Exception:
+        return {}
+
+
 def _numv(v, dp=2):
     try:
         f = float(v)
@@ -1252,8 +1304,10 @@ def _atr_pct(h, l, c, n: int = 14):
         return None
 
 
-def tech_row(symbol: str, d: dict) -> dict:
-    """Every technical value we can derive from one OHLCV history."""
+def tech_row(symbol: str, d: dict, benchmark_close: pd.Series | None = None) -> dict:
+    """Every technical value we can derive from one OHLCV history, plus the
+    StockMerit 2.0 signal features that only need price/volume history
+    (relative strength needs the benchmark's close series too)."""
     c, v, h, l = d.get("close"), d.get("vol"), d.get("high"), d.get("low")
     price = float(c.iloc[-1])
     yr = c.tail(252)
@@ -1280,6 +1334,13 @@ def tech_row(symbol: str, d: dict) -> dict:
         "Volume": last_vol, "AvgVol20": avg20,
         "VolX": _numv(last_vol / avg20) if (last_vol and avg20) else None,
         "ATRpct": _atr_pct(h, l, c),
+        "RS": _numv(merit_rs.relative_strength_score(c, benchmark_close), 1)
+              if benchmark_close is not None else None,
+        "BBSqueeze": _numv(merit_volatility.bollinger_score(c), 1),
+        "VolTrend": _numv(merit_volume.volume_trend_score(merit_volume.volume_trend(v)), 1)
+                    if v is not None else None,
+        "AccumScore": _numv(merit_volume.accumulation_score(h, l, c, v), 1)
+                      if h is not None and l is not None and v is not None else None,
         "_Spark": spark_svg(c),
     }
 
@@ -1290,8 +1351,9 @@ def fund_row(symbol: str) -> dict:
     missing figures stay None and are shown as 'n/a', never guessed."""
     out = {k: None for k in FUND_KEYS}
     out.update({"Sector": "n/a", "Industry": "n/a", "Buy/Sell": "n/a"})
+    tk = yf.Ticker(symbol)
     try:
-        info = yf.Ticker(symbol).info or {}
+        info = tk.info or {}
     except Exception:
         return out
     if not info:
@@ -1327,6 +1389,28 @@ def fund_row(symbol: str) -> dict:
     rk = info.get("recommendationKey")
     if rk and str(rk).lower() != "none":
         out["Buy/Sell"] = str(rk).replace("_", " ").title()
+
+    peg = info.get("pegRatio") or info.get("trailingPegRatio")
+    if not peg:
+        pe_val, eg = info.get("trailingPE"), info.get("earningsGrowth")
+        if pe_val and eg:
+            peg = float(pe_val) / (float(eg) * 100)
+    peg = float(peg) if isinstance(peg, (int, float)) and peg else None
+    out["PEG"] = _numv(peg)
+    out["PEGScore"] = _numv(merit_fundamentals.peg_score(peg), 1)
+
+    try:
+        qis = tk.quarterly_income_stmt
+    except Exception:
+        qis = None
+    try:
+        qcf = tk.quarterly_cashflow
+    except Exception:
+        qcf = None
+    accel = merit_fundamentals.earnings_acceleration(qis)
+    out["EarnAccel"] = _numv(merit_fundamentals.earnings_acceleration_score(accel), 1)
+    cfo_quality = merit_fundamentals.cash_flow_quality(qcf, qis)
+    out["CFOQuality"] = _numv(merit_fundamentals.cash_flow_quality_score(cfo_quality), 1)
     return out
 
 
@@ -1346,18 +1430,22 @@ def apply_num_filters(df: pd.DataFrame, filters: list[dict]) -> pd.DataFrame:
     return df
 
 
-def custom_screen(tickers: tuple[str, ...], filters: list[dict],
-                  sectors: list[str], cap: int = CUSTOM_FUND_CAP) -> tuple[pd.DataFrame, int, bool]:
-    """Run the funnel. Returns (dataframe, universe size priced, fundamentals loaded)."""
+def custom_screen(tickers: tuple[str, ...], filters: list[dict], sectors: list[str],
+                  cap: int = CUSTOM_FUND_CAP) -> tuple[pd.DataFrame, int, bool, tuple[str, float]]:
+    """Run the funnel. Returns (dataframe, universe size priced, fundamentals
+    loaded, (market regime label, market regime score))."""
     data = bulk_ohlcv(tuple(tickers))
+    bench = benchmark_ohlcv()
+    bench_close = bench.get("close")
+    regime = merit_trend.market_regime(bench_close) if bench_close is not None else ("Unknown", 50.0)
     if not data:
-        return pd.DataFrame(), 0, False
-    df = pd.DataFrame([tech_row(s, d) for s, d in data.items()])
+        return pd.DataFrame(), 0, False, regime
+    df = pd.DataFrame([tech_row(s, d, bench_close) for s, d in data.items()])
     priced = len(df)
     df = apply_num_filters(df, [f for f in filters if COL_META[f["col"]][1] == "T"])
     need_fund = bool(sectors) or any(COL_META[f["col"]][1] == "F" for f in filters)
     if not need_fund or df.empty:
-        return df.reset_index(drop=True), priced, False
+        return df.reset_index(drop=True), priced, False, regime
 
     df = df.head(cap).copy()
     bar = st.progress(0.0, text=f"Loading fundamentals for {len(df)} matches")
@@ -1371,8 +1459,38 @@ def custom_screen(tickers: tuple[str, ...], filters: list[dict],
     df = pd.concat([df, fdf], axis=1)
     if sectors:
         df = df[df["Sector"].astype(str).isin(sectors)]
+
+    # Phase 2 (StockMerit 2.0): sector strength vs the benchmark, then the
+    # composite MERIT SCORE -- both need technicals + fundamentals merged.
+    bench_ret_3m = _chg_pct(bench_close, 63) if bench_close is not None else None
+
+    def _clean(v):
+        """NaN (pandas' missing-numeric marker after a merge) must read as
+        missing the same way None does, or compute_merit_score /
+        sector_strength_score would treat it as a real 0-100 score."""
+        return None if v is None or (isinstance(v, float) and pd.isna(v)) else v
+
+    if "Chg3M" in df and not df.empty:
+        sector_avg_3m = df.groupby("Sector")["Chg3M"].transform("mean")
+        df["SectorRS"] = sector_avg_3m.apply(
+            lambda s: _numv(merit_trend.sector_strength_score(_clean(s), bench_ret_3m), 1))
+    else:
+        df["SectorRS"] = None
+
+    def _merit_row(row) -> float | None:
+        components = MeritComponents(
+            relative_strength=_clean(row.get("RS")), sector_strength=_clean(row.get("SectorRS")),
+            market_regime=regime[1], earnings_acceleration=_clean(row.get("EarnAccel")),
+            cash_flow_quality=_clean(row.get("CFOQuality")), peg=_clean(row.get("PEGScore")),
+            bollinger_squeeze=_clean(row.get("BBSqueeze")), volume_trend=_clean(row.get("VolTrend")),
+            accumulation=_clean(row.get("AccumScore")))
+        score, _breakdown = compute_merit_score(components)
+        return score
+
+    df["MeritScore"] = df.apply(_merit_row, axis=1) if not df.empty else None
+
     df = apply_num_filters(df, [f for f in filters if COL_META[f["col"]][1] == "F"])
-    return df.reset_index(drop=True), priced, True
+    return df.reset_index(drop=True), priced, True, regime
 
 
 # ------------------------------- mutual funds ------------------------------
@@ -2563,6 +2681,40 @@ if view == "Custom Screen":
                f"across the whole list; fundamentals then load for up to "
                f"{CUSTOM_FUND_CAP} technical matches.")
 
+    with st.expander("🧪 Signal Backtest — validate a signal before trusting it"):
+        st.caption("A signal should earn its weight in the MERIT SCORE by showing an edge "
+                   "in a stock's own history, not by looking plausible. Pick a stock and a "
+                   "signal definition below and this replays every past occurrence, then "
+                   "reports what actually happened in the following sessions.")
+        _bc = st.columns([2, 3, 1.4], gap="small")
+        _bt_symbol = _bc[0].text_input("Symbol", value="RELIANCE", key="bt_symbol").strip().upper()
+        _bt_signal = _bc[1].selectbox("Signal", list(merit_backtest.SIGNAL_LIBRARY), key="bt_signal")
+        _bc[2].markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        if _bc[2].button("Run backtest", key="bt_run", use_container_width=True) and _bt_symbol:
+            _hist = signal_backtest_history(_bt_symbol)
+            _close = _hist.get("close")
+            if not _hist or _close is None or len(_close) < 60:
+                st.error(f"Not enough price history for {_bt_symbol} to backtest.")
+            else:
+                _kind = merit_backtest.SIGNAL_LIBRARY[_bt_signal]
+                if _kind == "rsi_oversold":
+                    _sig_dates = merit_backtest.rsi_oversold_dates(rolling_rsi(_close))
+                else:
+                    _sig_dates = merit_backtest.bollinger_breakout_dates(
+                        _close, merit_volatility.bollinger_width(_close))
+                if not _sig_dates:
+                    st.warning(f"No historical occurrences of this signal for {_bt_symbol} "
+                              "in the available history.")
+                else:
+                    _outcomes = merit_backtest.forward_returns(_close, _sig_dates)
+                    _dd = merit_backtest.avg_max_drawdown(_outcomes)
+                    _dd_txt = f"{_dd:.1f}%" if _dd is not None else "n/a"
+                    st.markdown(f"**{len(_sig_dates)} historical signals** for {_bt_symbol} "
+                                f"&middot; avg max drawdown after entry: {_dd_txt}",
+                                unsafe_allow_html=True)
+                    st.dataframe(merit_backtest.summarize(_outcomes), hide_index=True,
+                                use_container_width=True)
+
     st.session_state.setdefault("cs_filters", [])
     st.session_state.setdefault("cs_universe", "NIFTY 50")
     st.session_state.setdefault("cs_nonce", 0)
@@ -2662,11 +2814,23 @@ if view == "Custom Screen":
             st.error(f"The {st.session_state['cs_universe']} list did not load. "
                      "Try again in a minute.")
         else:
-            _df, _priced, _hasf = custom_screen(
+            _df, _priced, _hasf, _regime = custom_screen(
                 tuple(_tks), st.session_state["cs_filters"], _sectors)
             st.session_state["cs_results"] = _df
             st.session_state["cs_priced"] = _priced
             st.session_state["cs_fund"] = _hasf
+            st.session_state["cs_regime"] = _regime
+
+    _regime = st.session_state.get("cs_regime")
+    if _regime:
+        _rlabel, _rscore = _regime
+        _rcolor = {"Bullish": "#0B7A4B", "Bearish": "#B3261E"}.get(_rlabel, "#8794A1")
+        st.markdown(
+            f'<div style="margin:4px 0 10px"><span class="pill" '
+            f'style="background:{_rcolor}">MARKET REGIME</span>&nbsp; '
+            f'<b>{_html.escape(_rlabel)}</b> '
+            f'<span style="color:#8794A1">(NIFTY 50 vs 50/200 DMA, score {_rscore:g}/100)</span></div>',
+            unsafe_allow_html=True)
 
     _res = st.session_state.get("cs_results")
     if _res is None:
@@ -2679,6 +2843,8 @@ if view == "Custom Screen":
         for _f in st.session_state["cs_filters"]:
             if _f["col"] not in _cols:
                 _cols.append(_f["col"])
+        if _hasf and "MeritScore" not in _cols:
+            _cols.append("MeritScore")
         if _hasf and "Buy/Sell" not in _cols:
             _cols.append("Buy/Sell")
         _cols = [c for c in _cols[:13] if c in _res.columns]
