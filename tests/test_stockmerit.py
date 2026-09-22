@@ -216,3 +216,106 @@ def test_bollinger_breakout_dates_finds_squeeze_then_breakout():
     dates = backtest.bollinger_breakout_dates(close, width, squeeze_pct=50.0, breakout_lookback=10)
     assert len(dates) > 0
     assert any(d >= close.index[40] for d in dates)  # the constructed breakout itself is detected
+
+
+# ------------------------------ intraday candidates ---------------------------
+
+from stockmerit.intraday import candidates as intraday  # noqa: E402
+
+
+def _ohlc_from_close(close: pd.Series, spread: float = 0.01):
+    """Synthesize O/H/L/V around a close series for feature/plan tests."""
+    high = close * (1 + spread)
+    low = close * (1 - spread)
+    open_ = close.shift(1).fillna(close.iloc[0])
+    vol = pd.Series([1000.0] * len(close), index=close.index)
+    return open_, high, low, vol
+
+
+def test_intraday_features_basic_shape():
+    close = _series(list(np.linspace(100, 130, 80)))  # steady uptrend
+    open_, high, low, vol = _ohlc_from_close(close)
+    feat = intraday.intraday_features(open_, high, low, close, vol, rsi=65.0, rs_score=70.0)
+    assert feat is not None
+    for k in ("price", "vwap", "ema20", "ema50", "atr", "atr_pct", "range_pos"):
+        assert feat[k] is not None
+    assert 0.0 <= feat["range_pos"] <= 1.0
+    assert feat["price"] == pytest.approx(float(close.iloc[-1]))
+
+
+def test_intraday_features_none_on_short_history():
+    close = _series([100.0] * 10)
+    assert intraday.intraday_features(None, None, None, close, None) is None
+
+
+def test_uptrend_scores_bullish_downtrend_scores_bearish():
+    up = _series(list(np.linspace(100, 140, 80)))
+    down = _series(list(np.linspace(140, 100, 80)))
+    ou, hu, lu, vu = _ohlc_from_close(up)
+    od, hd, ld, vd = _ohlc_from_close(down)
+    fu = intraday.intraday_features(ou, hu, lu, up, vu, rsi=68.0, rs_score=72.0)
+    fd = intraday.intraday_features(od, hd, ld, down, vd, rsi=32.0, rs_score=28.0)
+    su = intraday.score_candidate(fu)
+    sd = intraday.score_candidate(fd)
+    assert su["bull"] > su["bear"]
+    assert sd["bear"] > sd["bull"]
+    assert su["bull"] > sd["bull"]
+
+
+def test_relvol_lifts_both_sides_equally():
+    close = _series(list(np.linspace(100, 100.5, 80)))  # nearly flat -> ~neutral direction
+    open_, high, low, _ = _ohlc_from_close(close)
+    quiet = pd.Series([1000.0] * len(close), index=close.index)
+    busy = quiet.copy()
+    busy.iloc[-1] = 4000.0
+    fq = intraday.intraday_features(open_, high, low, close, quiet, rsi=50.0)
+    fb = intraday.intraday_features(open_, high, low, close, busy, rsi=50.0)
+    assert fb["rel_vol"] > fq["rel_vol"]
+    sq, sb = intraday.score_candidate(fq), intraday.score_candidate(fb)
+    assert sb["bull"] > sq["bull"] and sb["bear"] > sq["bear"]
+
+
+def test_long_plan_levels_are_ordered_and_rr_correct():
+    close = _series(list(np.linspace(100, 130, 80)))
+    open_, high, low, vol = _ohlc_from_close(close)
+    feat = intraday.intraday_features(open_, high, low, close, vol, rsi=65.0)
+    plan = intraday.trade_plan(feat, "long")
+    assert plan["stop"] < plan["entry_ref"] < plan["target_2r"] < plan["target_3r"]
+    r = plan["entry_ref"] - plan["stop"]
+    assert plan["target_2r"] == pytest.approx(plan["entry_ref"] + 2 * r, abs=0.02)
+    assert plan["target_3r"] == pytest.approx(plan["entry_ref"] + 3 * r, abs=0.02)
+
+
+def test_short_plan_levels_are_ordered_and_rr_correct():
+    close = _series(list(np.linspace(130, 100, 80)))
+    open_, high, low, vol = _ohlc_from_close(close)
+    feat = intraday.intraday_features(open_, high, low, close, vol, rsi=35.0)
+    plan = intraday.trade_plan(feat, "short")
+    assert plan["stop"] > plan["entry_ref"] > plan["target_2r"] > plan["target_3r"]
+    r = plan["stop"] - plan["entry_ref"]
+    assert plan["target_2r"] == pytest.approx(plan["entry_ref"] - 2 * r, abs=0.02)
+
+
+def test_sector_strength_tilts_scores():
+    close = _series(list(np.linspace(100, 130, 80)))
+    open_, high, low, vol = _ohlc_from_close(close)
+    feat = intraday.intraday_features(open_, high, low, close, vol, rsi=65.0)
+    strong = intraday.score_candidate(feat, sector_strength=90.0)
+    weak = intraday.score_candidate(feat, sector_strength=10.0)
+    assert strong["bull"] > weak["bull"]
+
+
+def test_rank_splits_and_respects_atr_floor():
+    up = _series(list(np.linspace(100, 140, 80)))
+    down = _series(list(np.linspace(140, 100, 80)))
+    def cand(sym, cl, rsi, rs):
+        o, h, l, v = _ohlc_from_close(cl)
+        f = intraday.intraday_features(o, h, l, cl, v, rsi=rsi, rs_score=rs)
+        return intraday.build_candidate(sym, f, sector="Tech", sector_strength=60.0)
+    cands = [cand("UP", up, 68, 72), cand("DOWN", down, 30, 28)]
+    out = intraday.rank(cands, top_n=1)
+    assert out["longs"][0]["symbol"] == "UP"
+    assert out["shorts"][0]["symbol"] == "DOWN"
+    # An impossibly high ATR floor drops everything.
+    empty = intraday.rank(cands, top_n=5, min_atr_pct=999.0)
+    assert empty["longs"] == [] and empty["shorts"] == []

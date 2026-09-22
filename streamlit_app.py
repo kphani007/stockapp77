@@ -37,6 +37,7 @@ from stockmerit.features import trend as merit_trend
 from stockmerit.features import volatility as merit_volatility
 from stockmerit.features import volume as merit_volume
 from stockmerit.features.momentum import rolling_rsi
+from stockmerit.intraday import candidates as merit_intraday
 from stockmerit.scoring import backtest as merit_backtest
 from stockmerit.scoring.merit_score import MeritComponents, compute_merit_score
 
@@ -59,13 +60,13 @@ NIFTY50 = [
 ]
 
 HEADERS = [
-    "Date", "Stock Symbol", "Sector", "Current Price (Rs)", "Volume",
+    "Date", "Stock Symbol", "Sector", "Current Price (Rs)", "200 DMA", "Volume",
     "RSI", "PEG", "VWAP", "PE", "Sec PE", "Buy/Sell", "52 Week High (Rs)", "1 Year Target (Rs)",
 ]
 
 COL_LABELS = {
     "Date": "Date", "Stock Symbol": "Stock Symbol", "Sector": "Sector",
-    "Current Price (Rs)": "Current Price", "Volume": "Volume", "RSI": "RSI",
+    "Current Price (Rs)": "Current Price", "200 DMA": "200 DMA", "Volume": "Volume", "RSI": "RSI",
     "PEG": "PEG", "VWAP": "VWAP", "PE": "PE", "Sec PE": "Sec PE",
     "Buy/Sell": "Buy/Sell", "52 Week High (Rs)": "52 Week High",
     "1 Year Target (Rs)": "1 Year Forecast",
@@ -606,6 +607,22 @@ def swing_levels(close: pd.Series, price: float, window: int = 10):
             float(res.min()) if len(res) else None)
 
 
+def _dma200_cell(dma, price) -> str:
+    """One table cell for the 200-day moving average, tinted green when price
+    is above it (long-term uptrend) and red when below."""
+    if not isinstance(dma, (int, float)):
+        return '<td class="c-num c-muted">n/a</td>'
+    color = "#5E6E7E"
+    tip = "200-day simple moving average"
+    if isinstance(price, (int, float)) and dma:
+        above = price >= dma
+        color = "#0B7A4B" if above else "#B3261E"
+        tip = (f"Price is {'above' if above else 'below'} the 200 DMA by "
+               f"{abs(price / dma - 1) * 100:.1f}%")
+    return (f'<td class="c-num" title="{tip}" style="color:{color};font-weight:600">'
+            f'{dma:,.2f}</td>')
+
+
 def sector_color(name) -> str:
     if not isinstance(name, str) or name in ("n/a", "not loaded", ""):
         return "#8794A1"
@@ -1093,6 +1110,7 @@ def scan(tickers: tuple[str, ...], threshold: float, fetch_fund_limit: int) -> p
             "Stock Symbol": sym.replace(".NS", ""),
             "Sector": f["sector"],
             "Current Price (Rs)": round(price, 2),
+            "200 DMA": _sma(cser, 200),
             "Volume": vol_map.get(sym),
             "52 Week High (Rs)": round(high52, 2) if high52 else None,
             "RSI": round(rsi, 1),
@@ -1240,6 +1258,58 @@ def bulk_ohlcv(tickers: tuple[str, ...], bucket: int = 0) -> dict:
 
 
 BENCHMARK_SYMBOL = "^NSEI"  # NIFTY 50 index, used for relative-strength / market-regime scoring
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def intraday_ohlcv(tickers: tuple[str, ...], bucket: int = 0) -> dict:
+    """6-month daily OHLCV (Open included, unlike bulk_ohlcv) for the intraday
+    candidate scan. `bucket` is a time slot -- pass int(time.time() // 60) to
+    force a fresh pull each minute while the market is open, so today's forming
+    bar (open, running high/low, volume-so-far) is picked up."""
+    out: dict = {}
+    batch, n = 200, len(tickers)
+    bar = st.progress(0.0, text="Downloading price history...")
+    for i in range(0, n, batch):
+        chunk = list(tickers[i:i + batch])
+        try:
+            data = yf.download(chunk, period="6mo", interval="1d", group_by="ticker",
+                               auto_adjust=False, threads=True, progress=False)
+        except Exception:
+            data = None
+        if data is not None and not getattr(data, "empty", True):
+            for sym in chunk:
+                try:
+                    df = data[sym] if len(chunk) > 1 else data
+                    c = df["Close"].dropna()
+                    if len(c) < 55:            # need >= 50 sessions for the 50 EMA
+                        continue
+                    out[sym] = {
+                        "open": df["Open"].dropna() if "Open" in df else None,
+                        "high": df["High"].dropna() if "High" in df else None,
+                        "low": df["Low"].dropna() if "Low" in df else None,
+                        "close": c,
+                        "vol": df["Volume"].dropna() if "Volume" in df else None,
+                    }
+                except Exception:
+                    continue
+        bar.progress(min((i + batch) / n, 1.0),
+                     text=f"Priced {min(i + batch, n)}/{n} securities")
+    bar.empty()
+    return out
+
+
+def session_fraction() -> float:
+    """Fraction of the NSE cash session (09:15-15:30 IST) elapsed, used to
+    project a partial day's volume to a full-day figure for relative volume.
+    Returns 1.0 outside market hours (nothing to project)."""
+    now = dt.datetime.now(IST)
+    open_t, close_t = dt.time(9, 15), dt.time(15, 30)
+    if now.weekday() >= 5 or now.time() <= open_t or now.time() >= close_t:
+        return 1.0
+    start = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    elapsed = (now - start).total_seconds()
+    total = 6.25 * 3600  # 6h15m
+    return float(max(0.05, min(1.0, elapsed / total)))
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -1491,6 +1561,87 @@ def custom_screen(tickers: tuple[str, ...], filters: list[dict], sectors: list[s
 
     df = apply_num_filters(df, [f for f in filters if COL_META[f["col"]][1] == "F"])
     return df.reset_index(drop=True), priced, True, regime
+
+
+# ====================== today's intraday candidates ========================
+# A systematic morning shortlist: price the whole universe, score every name
+# for long and short setups from the same signal blend a discretionary trader
+# eyeballs (relative volume, price vs VWAP, RSI, ATR, gap %, 20/50 EMA, the
+# previous day's high/low, relative strength, breakout proximity), then add
+# sector strength for the shortlist and attach an ATR/structure trade plan.
+
+INTRADAY_SHORTLIST = 12   # names per side sent for the sector-strength pass
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def intraday_candidates(tickers: tuple[str, ...], top_n: int, min_relvol: float,
+                        min_atr_pct: float, bucket: int = 0) -> dict:
+    """Rank a universe into the top long/short intraday setups. Returns a dict
+    with 'longs', 'shorts' (lists of candidate records), 'priced', 'session'
+    (fraction elapsed) and 'regime' (broad-market label, score)."""
+    data = intraday_ohlcv(tuple(tickers), bucket)
+    bench = benchmark_ohlcv()
+    bench_close = bench.get("close")
+    regime = merit_trend.market_regime(bench_close) if bench_close is not None else ("Unknown", 50.0)
+    sf = session_fraction()
+    if not data:
+        return {"longs": [], "shorts": [], "priced": 0, "session": sf, "regime": regime}
+
+    cands = []
+    for sym, d in data.items():
+        c = d.get("close")
+        rsi = compute_rsi(c)
+        rs = (merit_rs.relative_strength_score(c, bench_close)
+              if bench_close is not None else None)
+        feat = merit_intraday.intraday_features(
+            d.get("open"), d.get("high"), d.get("low"), c, d.get("vol"),
+            rsi=rsi, rs_score=rs, session_fraction=sf)
+        if feat is None:
+            continue
+        cand = merit_intraday.build_candidate(sym.replace(".NS", ""), feat)
+        cand["chg3m"] = _chg_pct(c, 63)
+        # apply the relative-volume floor here so a quiet name can't rank
+        if min_relvol and (feat.get("rel_vol") or 0) < min_relvol:
+            continue
+        cands.append(cand)
+
+    priced = len(cands)
+    # Preliminary split (no sector yet) to pick a shortlist worth the fund calls.
+    prelim = merit_intraday.rank(cands, top_n=INTRADAY_SHORTLIST, min_atr_pct=min_atr_pct)
+    shortlist = {c["symbol"]: c for c in prelim["longs"] + prelim["shorts"]}
+
+    # Sector strength across the shortlist, relative to NIFTY's own 3m return.
+    bench_ret_3m = _chg_pct(bench_close, 63) if bench_close is not None else None
+    sectors: dict[str, str] = {}
+    if shortlist:
+        bar = st.progress(0.0, text=f"Sector check for {len(shortlist)} names")
+        syms = list(shortlist)
+        for i, sym in enumerate(syms):
+            f = fund_row(f"{sym}.NS")
+            sectors[sym] = str(f.get("Sector") or "n/a")
+            bar.progress((i + 1) / len(syms), text=f"Sector {i + 1}/{len(syms)}")
+        bar.empty()
+    # mean 3m return per sector within the shortlist -> 0-100 strength
+    by_sector: dict[str, list[float]] = {}
+    for sym, sec in sectors.items():
+        ch = shortlist[sym].get("chg3m")
+        if sec not in ("n/a", "not loaded", "") and isinstance(ch, (int, float)):
+            by_sector.setdefault(sec, []).append(float(ch))
+    sector_avg = {s: sum(v) / len(v) for s, v in by_sector.items()}
+
+    for sym, cand in shortlist.items():
+        sec = sectors.get(sym, "n/a")
+        cand["sector"] = sec
+        ss = merit_trend.sector_strength_score(sector_avg.get(sec), bench_ret_3m)
+        cand["sector_strength"] = _numv(ss, 1) if ss is not None else None
+        rescored = merit_intraday.score_candidate(cand["feat"], cand["sector_strength"])
+        cand["bull"], cand["bear"], cand["sub"] = (
+            rescored["bull"], rescored["bear"], rescored["sub"])
+
+    final = merit_intraday.rank(list(shortlist.values()), top_n=top_n,
+                                min_atr_pct=min_atr_pct)
+    return {"longs": final["longs"], "shorts": final["shorts"],
+            "priced": priced, "session": sf, "regime": regime}
 
 
 # ------------------------------- mutual funds ------------------------------
@@ -2226,8 +2377,8 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
         i = ws.max_row
         for cell in ws[i]:
             cell.font = bfont
-        for hh in ("Current Price (Rs)", "52 Week High (Rs)", "1 Year Target (Rs)",
-                   "PE", "Sec PE"):
+        for hh in ("Current Price (Rs)", "200 DMA", "52 Week High (Rs)",
+                   "1 Year Target (Rs)", "PE", "Sec PE"):
             c = ws.cell(row=i, column=col_of[hh])
             if isinstance(c.value, (int, float)):
                 c.number_format = "#,##0.00"
@@ -2240,7 +2391,7 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
             for cell in ws[i]:
                 cell.fill = hot
 
-    for i, w in enumerate([12, 16, 22, 16, 14, 8, 8, 10, 14, 16, 16], start=1):
+    for i, w in enumerate([12, 16, 22, 16, 14, 14, 8, 8, 10, 14, 16, 16], start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.freeze_panes = "A2"
     last_col = get_column_letter(len(HEADERS))
@@ -2546,7 +2697,7 @@ live_on = True
 live_every = 1
 
 # --- top nav: Screener / Stock OI / News ---
-_view_map = {"screener": "Screener", "custom": "Custom Screen",
+_view_map = {"screener": "Screener", "intraday": "Intraday", "custom": "Custom Screen",
              "mf": "Mutual Funds", "etf": "ETFs", "sif": "SIF",
              "oi": "Stock OI", "news": "News"}
 _qp_view = str(st.query_params.get("view", "")).lower()
@@ -2556,8 +2707,8 @@ if "_pending_view" in st.session_state:
     st.session_state["view"] = st.session_state.pop("_pending_view")
 st.session_state.setdefault("view", "Screener")
 st.sidebar.markdown('<div class="nav-h">Sections</div>', unsafe_allow_html=True)
-view = st.sidebar.radio("view", ["Screener", "Stock OI", "Custom Screen", "ETFs",
-                                "SIF", "Mutual Funds", "News"],
+view = st.sidebar.radio("view", ["Screener", "Intraday", "Stock OI", "Custom Screen",
+                                "ETFs", "SIF", "Mutual Funds", "News"],
                         label_visibility="collapsed", key="view")
 st.sidebar.markdown('<div class="nav-foot">Collapse this panel with the arrow above. '
                     'Data is reference only — not investment advice.</div>',
@@ -2565,7 +2716,7 @@ st.sidebar.markdown('<div class="nav-foot">Collapse this panel with the arrow ab
 
 # --- header row: compact banner, with the stock search beside it on the tabs
 # where a stock lookup makes sense (mutual funds and ETFs have their own search)
-_SEARCH_TABS = {"Screener", "Custom Screen", "Stock OI", "News"}
+_SEARCH_TABS = {"Screener", "Intraday", "Custom Screen", "Stock OI", "News"}
 if view in _SEARCH_TABS:
     _hb, _sbox = st.columns([3, 1], gap="medium")
     _hb.markdown(_BAND_HTML, unsafe_allow_html=True)
@@ -2610,6 +2761,176 @@ if view == "News":
         st.caption("Headlines from public RSS feeds — click to read at the source.")
     else:
         st.info("News feed unavailable right now.")
+    st.stop()
+
+if view == "Intraday":
+    st.markdown("### Today's intraday candidates")
+    st.markdown(
+        '<div class="sh-hint">A systematic morning shortlist. Every stock in the '
+        'chosen list is scored for long <em>and</em> short setups from the same '
+        'signal blend — relative volume, price vs VWAP, RSI, ATR, gap %, 20/50 EMA, '
+        'previous-day high/low, relative strength vs NIFTY, sector strength and '
+        'breakout proximity — then the top names get an ATR / structure-based '
+        'trade plan (entry zone, invalidation, 2R / 3R targets). '
+        'VWAP here is the 20-session rolling VWAP from daily bars, not a true '
+        'single-session intraday VWAP. Levels are mechanical planning aids, not '
+        'predictions or advice.</div>', unsafe_allow_html=True)
+
+    _im_active = market_open()
+    _sf = session_fraction()
+    if _im_active:
+        st.caption(f"🟢 Market open · relative volume is projected to a full day "
+                   f"(~{_sf * 100:.0f}% of the session elapsed).")
+    else:
+        st.caption("⚪ Market closed · scoring the last completed session.")
+
+    st.session_state.setdefault("iu_universe", "NIFTY 50")
+    _iurow = st.columns(len(UNIVERSES), gap="small")
+    for _c, _n in zip(_iurow, UNIVERSES):
+        if _c.button(_n, use_container_width=True,
+                     type="primary" if st.session_state["iu_universe"] == _n else "secondary",
+                     key=f"iu_{_n}"):
+            st.session_state["iu_universe"] = _n
+            st.rerun()
+    _iu = st.session_state["iu_universe"]
+    if _iu == "All NIFTY Stocks":
+        st.caption("All NIFTY Stocks prices ~2000 names and can take a few minutes. "
+                   "NIFTY 500 is the better broad option for a daily intraday shortlist.")
+
+    _o1, _o2, _o3 = st.columns(3, gap="large")
+    _top_n = _o1.slider("Candidates per side", 3, 10, 5, key="i_topn")
+    _min_rv = _o2.slider("Min relative volume", 0.0, 3.0, 1.2, 0.1, key="i_minrv",
+                         help="Drop names trading below this multiple of their 20-day "
+                              "average volume.")
+    _min_atr = _o3.slider("Min ATR %", 0.0, 8.0, 1.5, 0.5, key="i_minatr",
+                          help="Drop names too quiet (ATR below this % of price) to be "
+                               "worth trading intraday.")
+
+    _irun = st.button("Find candidates", type="primary")
+    if _irun:
+        _tks = tickers_for(_iu)
+        if not _tks:
+            st.error(f"The {_iu} list did not load. Try again in a minute.")
+            st.stop()
+        _bucket = int(time.time() // 60) if _im_active else 0
+        st.session_state["intraday_res"] = intraday_candidates(
+            tuple(_tks), int(_top_n), float(_min_rv), float(_min_atr), _bucket)
+        st.session_state["intraday_universe"] = _iu
+
+    _ires = st.session_state.get("intraday_res")
+
+    def _score_color(v) -> str:
+        if not isinstance(v, (int, float)):
+            return "#5E6E7E"
+        if v >= 65:
+            return "#0B7A4B"
+        if v >= 55:
+            return "#0E7C86"
+        if v <= 40:
+            return "#B3261E"
+        return "#5E6E7E"
+
+    def _z(v):
+        return f"{v:,.2f}" if isinstance(v, (int, float)) else "n/a"
+
+    def _pct(v):
+        return f"{v:+.2f}%" if isinstance(v, (int, float)) else "n/a"
+
+    def _intraday_table(cands: list[dict], side: str) -> str:
+        heads = ["#", "Symbol", "Sector", "Score", "Price", "Rel Vol", "RSI",
+                 "ATR %", "Gap %", "VWAP", "Trend", "Sector str.",
+                 "Entry zone", "SL (invalidation)", "Target 2R", "Target 3R"]
+        aligns = ["c", "l", "l", "c", "r", "r", "r", "r", "r", "c", "c", "r",
+                  "c", "r", "r", "r"]
+        head = "".join(f'<th class="th-{a}">{h}</th>' for h, a in zip(heads, aligns))
+        body = []
+        for i, c in enumerate(cands, 1):
+            feat = c["feat"]
+            plan = c["long_plan"] if side == "long" else c["short_plan"]
+            score = c["bull"] if side == "long" else c["bear"]
+            price = feat.get("price")
+            vwap = feat.get("vwap")
+            vw_pos = ("Above" if (vwap and price >= vwap) else "Below") if vwap else "n/a"
+            vw_clr = "#0B7A4B" if vw_pos == "Above" else "#B3261E" if vw_pos == "Below" else "#5E6E7E"
+            e20, e50 = feat.get("ema20"), feat.get("ema50")
+            if e20 and e50 and price:
+                up = price >= e20 and e20 >= e50
+                dn = price <= e20 and e20 <= e50
+                trend = "▲ 20>50" if up else "▼ 20<50" if dn else "• mixed"
+                tr_clr = "#0B7A4B" if up else "#B3261E" if dn else "#5E6E7E"
+            else:
+                trend, tr_clr = "n/a", "#5E6E7E"
+            rv = feat.get("rel_vol")
+            rv_txt = f"{rv:.2f}×" if isinstance(rv, (int, float)) else "n/a"
+            sym = c["symbol"]
+            href = f"?stock={sym}"
+            entry = (f'{_z(plan["entry_low"])} – {_z(plan["entry_high"])}'
+                     if plan else "n/a")
+            body.append(
+                "<tr>"
+                f'<td class="c-num c-muted">{i}</td>'
+                f'<td><a class="c-sym" href="{href}" target="_self">{sym}</a></td>'
+                f'<td class="c-sec" style="color:{sector_color(c.get("sector"))}">'
+                f'{_html.escape(str(c.get("sector") or "n/a"))}</td>'
+                f'<td class="c-num" style="text-align:center;font-weight:700;'
+                f'color:{_score_color(score)}">{score:.0f}</td>'
+                f'<td class="c-num c-price">{_z(price)}</td>'
+                f'<td class="c-num">{rv_txt}</td>'
+                f'<td class="c-num" style="color:{rsi_color(feat.get("rsi"))}">'
+                f'{_z(feat.get("rsi")) if feat.get("rsi") is not None else "n/a"}</td>'
+                f'<td class="c-num c-muted">{_z(feat.get("atr_pct"))}</td>'
+                f'<td class="c-num">{_pct(feat.get("gap_pct"))}</td>'
+                f'<td style="text-align:center;font-weight:600;color:{vw_clr}">{vw_pos}</td>'
+                f'<td style="text-align:center;font-weight:600;color:{tr_clr}">{trend}</td>'
+                f'<td class="c-num c-muted">{_z(c.get("sector_strength"))}</td>'
+                f'<td style="text-align:center">{entry}</td>'
+                f'<td class="c-num" style="color:#B3261E;font-weight:600">'
+                f'{_z(plan["stop"]) if plan else "n/a"}</td>'
+                f'<td class="c-num" style="color:#0B7A4B">'
+                f'{_z(plan["target_2r"]) if plan else "n/a"}</td>'
+                f'<td class="c-num" style="color:#0B7A4B;font-weight:600">'
+                f'{_z(plan["target_3r"]) if plan else "n/a"}</td>'
+                "</tr>")
+        return ('<div class="sh-tablewrap"><table class="sh-table"><thead><tr>'
+                + head + "</tr></thead><tbody>" + "".join(body) + "</tbody></table></div>")
+
+    if _ires is None:
+        st.info("Pick a stock list and press **Find candidates** to build today's "
+                "long and short shortlist.")
+    elif not _ires["longs"] and not _ires["shorts"]:
+        st.warning("No names cleared the relative-volume / ATR filters. Lower the "
+                   "minimums or widen the stock list.")
+    else:
+        _reg_lbl, _reg_score = _ires["regime"]
+        _reg_clr = ("#0B7A4B" if _reg_lbl == "Bullish"
+                    else "#B3261E" if _reg_lbl == "Bearish" else "#5E6E7E")
+        st.markdown(
+            f'Scored **{_ires["priced"]}** names from '
+            f'**{st.session_state.get("intraday_universe", _iu)}**. Broad market '
+            f'(NIFTY 50 vs its 50/200 DMA): '
+            f'<span style="color:{_reg_clr};font-weight:700">{_reg_lbl}</span>. '
+            "Long setups tend to work better in a bullish tape, shorts in a bearish "
+            "one — trade with the regime, not against it.", unsafe_allow_html=True)
+
+        _n_long = len(_ires["longs"])
+        _n_short = len(_ires["shorts"])
+        st.markdown(f'<div class="sec-label" style="margin-top:10px;color:#0B7A4B">'
+                    f'▲ Top {_n_long} long candidates</div>', unsafe_allow_html=True)
+        st.markdown(_intraday_table(_ires["longs"], "long"), unsafe_allow_html=True)
+
+        st.markdown(f'<div class="sec-label" style="margin-top:18px;color:#B3261E">'
+                    f'▼ Top {_n_short} short candidates</div>', unsafe_allow_html=True)
+        st.markdown(_intraday_table(_ires["shorts"], "short"), unsafe_allow_html=True)
+
+        st.caption("Score is the 0-100 long (bull) or short (bear) blend. Entry zone, "
+                   "SL and targets are anchored on ATR and the nearest structural level "
+                   "(VWAP, 20 EMA, previous-day high/low); R is entry-to-stop, so 2R / 3R "
+                   "are that risk projected in the trade's direction. Sector strength is "
+                   "measured across the candidate shortlist relative to NIFTY. "
+                   "Click any symbol for its full detail view.")
+
+    st.markdown(f'<div class="disc"><strong>Disclaimer</strong> — {DISCLAIMER}</div>',
+                unsafe_allow_html=True)
     st.stop()
 
 if view == "Stock OI":
@@ -3352,7 +3673,7 @@ else:
     def _fmt(x):
         return f"{x:,.2f}" if isinstance(x, (int, float)) else str(x)
 
-    aligns = ["l", "l", "l", "r", "r", "r", "r", "c", "r", "r", "c", "r", "r"]
+    aligns = ["l", "l", "l", "r", "r", "r", "r", "r", "c", "r", "r", "c", "r", "r"]
     _hpairs = list(zip(HEADERS, aligns))
     _pi = [h for h, _a in _hpairs].index("Current Price (Rs)")
     _hpairs.insert(_pi, ("Trend", "c"))
@@ -3385,6 +3706,7 @@ else:
             f'<td class="c-sec" style="color:{sector_color(r["Sector"])}">{_html.escape(str(r["Sector"]))}</td>'
             + spark_cell(r.get("_Spark", ""), "Closing price, last 30 sessions") +
             f'<td class="c-num c-price" title="{sma_tip}">{_fmt(r["Current Price (Rs)"])}</td>'
+            + _dma200_cell(r.get("200 DMA"), r.get("Current Price (Rs)")) +
             f'<td class="c-num c-muted">{_vol(r.get("Volume"))}</td>'
             f'<td class="c-num c-rsi" style="color:{rsi_color(rsi)}">{rsi_txt}</td>'
             f'<td class="c-num c-muted">{peg_txt}</td>'
