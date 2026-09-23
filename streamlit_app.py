@@ -2634,8 +2634,10 @@ def _track_and_get_stats() -> dict:
 
 
 def _render_visitor_counter(data: dict) -> None:
-    """Public odometer-style footer badge showing total page hits."""
-    digits = f"{int(data.get('hits', 0)):06d}"
+    """Public odometer-style footer badge showing unique visitors (by
+    first-party cookie), so a refresh/reload by the same browser doesn't
+    bump the count the way a raw page-hit total would."""
+    digits = f"{len(data.get('unique', [])):06d}"
     tiles = "".join(f'<span class="vc-digit">{d}</span>' for d in digits)
     st.markdown(
         '<div class="vc-wrap"><div class="vc-badge">'
