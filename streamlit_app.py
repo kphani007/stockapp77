@@ -2064,27 +2064,42 @@ def load_sifs() -> tuple[pd.DataFrame, str, list[str]]:
 
 @st.cache_data(ttl=10800, show_spinner=False)
 def sif_history(code: str) -> dict:
-    """Point-to-point returns for one strategy from its published NAV history.
-    SIF codes live in the same AMFI code space, so the NAV history mirror is
-    tried first; strategies launched too recently return n/a rather than a
-    figure stitched from a shorter window."""
+    """Point-to-point returns for one strategy from its published NAV history,
+    read from mfapi.in's AMFI mirror (the same source the Mutual Funds tab
+    uses). SIF codes are assumed to live in the same AMFI code space, but
+    that mirror may simply not carry a given SIF's history yet -- SIFs are
+    a product category AMFI only started publishing in 2025. "Why" carries
+    a short, honest diagnostic for that case rather than a bare, unexplained
+    n/a; a genuinely short track record still yields a "Since inception"
+    figure (as soon as there are 2+ published NAVs), so "Why" only fires
+    when even that isn't available."""
     out = {k: None for k in ("1M", "3M", "6M", "1Y", "SI", "Start")}
+    out["Why"] = None
     if not code:
+        out["Why"] = "no scheme code found for this row's data source"
         return out
     try:
-        j = requests.get(f"https://api.mfapi.in/mf/{code}", timeout=12,
-                         headers={"User-Agent": "Mozilla/5.0",
-                                  "Accept": "application/json"}).json()
+        resp = requests.get(f"https://api.mfapi.in/mf/{code}", timeout=12,
+                            headers={"User-Agent": "Mozilla/5.0",
+                                     "Accept": "application/json"})
+        if resp.status_code != 200:
+            out["Why"] = f"mfapi.in returned HTTP {resp.status_code} for code {code}"
+            return out
+        raw = (resp.json() or {}).get("data") or []
         pairs = {}
-        for x in (j.get("data") or []):
+        for x in raw:
             try:
                 pairs[pd.to_datetime(x["date"], format="%d-%m-%Y")] = float(x["nav"])
             except (ValueError, TypeError, KeyError):
                 continue
         if len(pairs) < 2:
+            out["Why"] = (f"mfapi.in has no NAV history for code {code}" if not raw else
+                          f"mfapi.in returned only {len(pairs)} usable NAV point(s) for "
+                          f"code {code}")
             return out
         ser = pd.Series(pairs).sort_index()
-    except Exception:
+    except Exception as exc:
+        out["Why"] = f"{type(exc).__name__} calling mfapi.in for code {code}"
         return out
     last, last_dt = float(ser.iloc[-1]), ser.index[-1]
     first, first_dt = float(ser.iloc[0]), ser.index[0]
@@ -3490,9 +3505,12 @@ if view == "SIF":
     _sdate = str(_sif["Date"].iloc[0]) if "Date" in _sif else ""
     st.caption(f"{len(_sif):,} investment strategies with an AMFI-published NAV"
                + (f" (latest {_sdate})" if _sdate else "")
-               + f" · source: {_sif_src}. Returns are computed from each strategy's own "
-                 "NAV history; every SIF launched from 2025 onward, so windows longer "
-                 "than the track record read n/a rather than being annualised.")
+               + f" · source: {_sif_src}. Returns are read from each strategy's own NAV "
+                 "history on mfapi.in's AMFI mirror; every SIF launched from 2025 "
+                 "onward, so windows longer than the track record read n/a. If even "
+                 "'Since inception' reads n/a for a strategy, that mirror likely "
+                 "doesn't carry that scheme's NAV history yet, not that it lacks one "
+                 "-- see \"Why returns are missing\" below the table.")
 
     _s1 = st.columns([2.2, 2.2, 1.6, 1.8, 1.6], gap="small")
     _s_houses = ["All fund houses"] + sorted(h for h in _sif["House"].unique() if h)
@@ -3598,6 +3616,26 @@ if view == "SIF":
                "derivatives and short positions and are a distinct risk class from "
                "mutual funds; read the ISID, SID and KIM before investing. Hover the "
                "iNAV and TER cells for why those figures are not published in this feed.")
+
+    _s_whys, _s_seen = [], set()
+    for _c7 in _spool["Code"]:
+        if not _c7 or _c7 in _s_seen:
+            continue
+        _s_seen.add(_c7)
+        _w7 = (st.session_state["sif_hist"].get(_c7) or {}).get("Why")
+        if _w7:
+            _s_whys.append((_c7, _w7))
+    if _s_whys:
+        with st.expander(f"Why returns are missing for {len(_s_whys)} of "
+                         f"{len(_spool)} strategies shown"):
+            st.caption("One reason per scheme code actually seen just now, not a guess "
+                      "-- if every strategy below shows the same reason, the NAV-history "
+                      "mirror itself is the gap, not any one fund's track record.")
+            for _c7, _w7 in _s_whys[:15]:
+                st.markdown(f"- `{_c7}`: {_w7}")
+            if len(_s_whys) > 15:
+                st.caption(f"...and {len(_s_whys) - 15} more.")
+
     st.markdown(f'<div class="disc"><strong>Disclaimer</strong> — {DISCLAIMER}</div>',
                 unsafe_allow_html=True)
     st.stop()
