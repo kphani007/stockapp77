@@ -2604,26 +2604,53 @@ def _inject_ga() -> None:
     """, height=0)
 
 
+def _client_ip() -> str | None:
+    """Best-effort client IP for de-duplicating visitors. Prefers the
+    reverse-proxy header (Streamlit Cloud and most hosts sit behind one,
+    so the raw socket peer is usually the proxy itself, not the visitor)
+    and falls back to the direct connection's address."""
+    try:
+        xff = st.context.headers.get("X-Forwarded-For")
+        if xff:
+            return xff.split(",")[0].strip()
+    except Exception:
+        pass
+    try:
+        return st.context.ip_address
+    except Exception:
+        return None
+
+
 def _track_and_get_stats() -> dict:
-    """Count unique browsers (via a first-party cookie) and total page hits.
-    Stored in a local JSON file. Ephemeral on Streamlit Cloud - see notes."""
+    """Count unique visitors and total page hits, stored in a local JSON
+    file. A visitor is de-duplicated by IP address when one can be read
+    from the request; only when no IP is available (e.g. localhost) does
+    it fall back to a first-party cookie. Either way, refreshing the page
+    should not inflate the count. Ephemeral on Streamlit Cloud - see notes."""
     try:
         with open(_STATS_FILE) as fh:
             data = json.load(fh)
     except Exception:
         data = {"unique": [], "hits": 0}
-    vid = None
-    try:
-        vid = st.context.cookies.get("sm_vid")
-    except Exception:
-        pass
-    if not vid:
-        vid = uuid.uuid4().hex
-        components.html(
-            f"<script>document.cookie='sm_vid={vid};max-age=31536000;path=/;SameSite=Lax';</script>",
-            height=0)
-    if vid not in data["unique"]:
-        data["unique"].append(vid)
+
+    ip = _client_ip()
+    if ip:
+        key = f"ip:{ip}"
+    else:
+        vid = None
+        try:
+            vid = st.context.cookies.get("sm_vid")
+        except Exception:
+            pass
+        if not vid:
+            vid = uuid.uuid4().hex
+            components.html(
+                f"<script>document.cookie='sm_vid={vid};max-age=31536000;path=/;SameSite=Lax';</script>",
+                height=0)
+        key = f"cookie:{vid}"
+
+    if key not in data["unique"]:
+        data["unique"].append(key)
     data["hits"] = int(data.get("hits", 0)) + 1
     try:
         with open(_STATS_FILE, "w") as fh:
@@ -2634,9 +2661,9 @@ def _track_and_get_stats() -> dict:
 
 
 def _render_visitor_counter(data: dict) -> None:
-    """Public odometer-style footer badge showing unique visitors (by
-    first-party cookie), so a refresh/reload by the same browser doesn't
-    bump the count the way a raw page-hit total would."""
+    """Public odometer-style footer badge showing unique visitors (see
+    _track_and_get_stats), so a refresh/reload doesn't bump the count the
+    way a raw page-hit total would."""
     digits = f"{len(data.get('unique', [])):06d}"
     tiles = "".join(f'<span class="vc-digit">{d}</span>' for d in digits)
     st.markdown(
