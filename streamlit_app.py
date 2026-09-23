@@ -3706,8 +3706,14 @@ elif results.empty:
     st.warning(f"Nothing is at RSI {st.session_state.get('threshold', threshold)} or "
                "above right now. Lower the threshold or widen the stock list.")
 else:
-    _all_bs = [b for b in ["Buy", "Sell", "Hold", "Neutral"]
-               if b in set(results["Buy/Sell"].astype(str))]
+    # yfinance's recommendationKey can be any of these (title-cased in fund_row /
+    # fetch_fundamentals), plus "n/a" (no rating published) and "not loaded" (fundamentals
+    # not fetched for this row, beyond the fetch limit) -- list every value actually present
+    # in this scan's results, in a sensible buy->sell order, rather than a fixed guess.
+    _BS_ORDER = ["Strong Buy", "Buy", "Outperform", "Hold", "Underperform",
+                 "Sell", "Strong Sell", "n/a", "not loaded"]
+    _present_bs = set(results["Buy/Sell"].astype(str))
+    _all_bs = [b for b in _BS_ORDER if b in _present_bs] + sorted(_present_bs - set(_BS_ORDER))
     _fc1, _fc2 = st.columns([2, 6], gap="small")
     _bs_choice = _fc1.selectbox("Buy/Sell", ["All"] + _all_bs, index=0, key="bs_filter")
     if _bs_choice != "All":
