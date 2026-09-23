@@ -486,6 +486,17 @@ div[role="dialog"]{ max-width:600px !important; }
 
 .disc{ font-size:0.76rem; color:var(--muted); line-height:1.6;
   border-top:1px solid var(--line); padding-top:14px; margin-top:10px; }
+
+.vc-wrap{ display:flex; justify-content:flex-end; margin:10px 0 2px; }
+.vc-badge{ display:inline-flex; align-items:center; gap:8px; background:var(--ink);
+  border-radius:6px; padding:6px 10px; box-shadow:0 4px 14px -8px rgba(17,28,43,0.55); }
+.vc-label{ font-family:'Archivo',sans-serif; font-weight:700; font-size:0.82rem;
+  color:#FFF; white-space:nowrap; }
+.vc-digits{ display:flex; gap:2px; }
+.vc-digit{ font-family:'IBM Plex Mono',monospace; font-weight:600; font-size:0.95rem;
+  color:#111C2B; background:#DCE3E8; border:1px solid #8C98A4; border-radius:2px;
+  min-width:16px; text-align:center; padding:2px 3px; line-height:1.15;
+  box-shadow:inset 0 1px 2px rgba(0,0,0,0.25); }
 .stButton>button{ border-radius:9px; font-weight:500; padding:6px 10px; font-size:0.9rem; }
 .stDownloadButton>button{ background:transparent; color:var(--teal);
   border:1px solid var(--teal); font-weight:600; border-radius:9px; padding:5px 14px; }
@@ -2622,6 +2633,17 @@ def _track_and_get_stats() -> dict:
     return data
 
 
+def _render_visitor_counter(data: dict) -> None:
+    """Public odometer-style footer badge showing total page hits."""
+    digits = f"{int(data.get('hits', 0)):06d}"
+    tiles = "".join(f'<span class="vc-digit">{d}</span>' for d in digits)
+    st.markdown(
+        '<div class="vc-wrap"><div class="vc-badge">'
+        f'<span class="vc-label">Visitors:</span>'
+        f'<span class="vc-digits">{tiles}</span>'
+        '</div></div>', unsafe_allow_html=True)
+
+
 def _maybe_show_admin_stats() -> None:
     try:
         key = str(st.secrets.get("ADMIN_KEY", "")).strip()
@@ -2649,7 +2671,7 @@ st.set_page_config(page_title="StockMerit — NSE RSI Screener",
 st.markdown(CSS, unsafe_allow_html=True)
 
 _inject_ga()
-_track_and_get_stats()
+_visitor_stats = _track_and_get_stats()
 _maybe_show_admin_stats()
 
 
@@ -3736,3 +3758,4 @@ else:
 
 st.markdown(f'<div class="disc"><strong>Disclaimer</strong> — {DISCLAIMER}</div>',
             unsafe_allow_html=True)
+_render_visitor_counter(_visitor_stats)
