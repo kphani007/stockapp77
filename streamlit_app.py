@@ -40,6 +40,7 @@ from stockmerit.features.momentum import rolling_rsi
 from stockmerit.intraday import candidates as merit_intraday
 from stockmerit.scoring import backtest as merit_backtest
 from stockmerit.scoring.merit_score import MeritComponents, compute_merit_score
+from stockmerit.radar import scan_master_radar
 
 RSI_PERIOD = 14
 FUND_LIMIT = 100
@@ -2773,7 +2774,7 @@ if "_pending_view" in st.session_state:
     st.session_state["view"] = st.session_state.pop("_pending_view")
 st.session_state.setdefault("view", "Screener")
 st.sidebar.markdown('<div class="nav-h">Sections</div>', unsafe_allow_html=True)
-view = st.sidebar.radio("view", ["Screener", "Intraday", "Stock OI", "Custom Screen",
+view = st.sidebar.radio("view", ["Screener", "Master Radar", "Intraday", "Stock OI", "Custom Screen",
                                 "ETFs", "SIF", "Mutual Funds", "News"],
                         label_visibility="collapsed", key="view")
 st.sidebar.markdown('<div class="nav-foot">Collapse this panel with the arrow above. '
@@ -2813,6 +2814,36 @@ qp_stock = st.query_params.get("stock")
 if qp_stock and _valid_symbol(str(qp_stock)) and st.session_state.get("qp_opened") != qp_stock:
     st.session_state["qp_opened"] = qp_stock
     detail_dialog(str(qp_stock).upper())
+
+if view == "Master Radar":
+    st.markdown("### Master Radar")
+    st.caption("Fixed scoring model; the universe and market data change, not the methodology. "
+               "Scores are research signals, not forecasts or recommendations.")
+    _ru = st.selectbox("Universe", ["NIFTY 500", "All NIFTY Stocks"], key="radar_universe")
+    _rf = st.slider("Fundamental enrichment", 50, 250, 120, 10, key="radar_fund_limit")
+    _rr = st.button("Run Master Radar", type="primary", use_container_width=True)
+    if _rr:
+        _ticks = tickers_for(_ru)
+        if not _ticks:
+            st.error("Could not load the selected NSE universe.")
+        else:
+            with st.spinner(f"Scanning {len(_ticks):,} stocks. Technical scan first, fundamentals only for the strongest candidates..."):
+                _rad = scan_master_radar(_ticks, fund_limit=int(_rf))
+            st.session_state["master_radar"] = _rad
+    _rad = st.session_state.get("master_radar")
+    if _rad is not None and not _rad.empty:
+        _show = ["Symbol","Status","Radar Score","Sector","Price","RSI","SMA50","SMA200",
+                 "RelVol","From20DHigh%","Return63D%","Fundamental Score","PE","PEG"]
+        _show = [c for c in _show if c in _rad.columns]
+        st.dataframe(_rad[_show], use_container_width=True, hide_index=True)
+        st.download_button("Download Master Radar CSV", _rad.to_csv(index=False),
+                           "stockmerit_master_radar.csv", "text/csv")
+        st.caption("Status thresholds: Core Candidate >=75, Emerging 65–74.9, Watch 55–64.9. "
+                   "These are labels for the fixed model, not investment advice. "
+                   "Re-run after a material market move; do not treat yesterday's score as current.")
+    elif _rad is not None:
+        st.warning("No usable price histories were returned for this scan.")
+    st.stop()
 
 if view == "News":
     st.markdown("### Financial news")
