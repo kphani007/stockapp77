@@ -38,6 +38,7 @@ from stockmerit.features import volatility as merit_volatility
 from stockmerit.features import volume as merit_volume
 from stockmerit.features.momentum import rolling_rsi
 from stockmerit.intraday import candidates as merit_intraday
+from stockmerit.intraday.sizing import size_position
 from stockmerit.scoring import backtest as merit_backtest
 from stockmerit.scoring.merit_score import MeritComponents, compute_merit_score
 from stockmerit.radar import scan_master_radar
@@ -2764,7 +2765,8 @@ live_on = True
 live_every = 1
 
 # --- top nav: Screener / Stock OI / News ---
-_view_map = {"screener": "Screener", "intraday": "Intraday", "custom": "Custom Screen",
+_view_map = {"screener": "Screener", "intraday": "Intraday", "sizer": "Position Sizer",
+             "custom": "Custom Screen",
              "mf": "Mutual Funds", "etf": "ETFs", "sif": "SIF",
              "oi": "Stock OI", "news": "News"}
 _qp_view = str(st.query_params.get("view", "")).lower()
@@ -2774,7 +2776,8 @@ if "_pending_view" in st.session_state:
     st.session_state["view"] = st.session_state.pop("_pending_view")
 st.session_state.setdefault("view", "Screener")
 st.sidebar.markdown('<div class="nav-h">Sections</div>', unsafe_allow_html=True)
-view = st.sidebar.radio("view", ["Screener", "Master Radar", "Intraday", "Stock OI", "Custom Screen",
+view = st.sidebar.radio("view", ["Screener", "Master Radar", "Intraday", "Position Sizer",
+                                "Stock OI", "Custom Screen",
                                 "ETFs", "SIF", "Mutual Funds", "News"],
                         label_visibility="collapsed", key="view")
 st.sidebar.markdown('<div class="nav-foot">Collapse this panel with the arrow above. '
@@ -2859,6 +2862,61 @@ if view == "News":
     else:
         st.info("News feed unavailable right now.")
     st.stop()
+
+if view == "Position Sizer":
+    st.markdown("### Intraday position sizer")
+    st.caption("Sets the share count so a stop-out costs no more than the loss you choose. "
+               "It is arithmetic, not a forecast or advice. Take the real charges figure "
+               "from your broker's calculator.")
+
+    _ps_dir = st.radio("Direction", ["Buy first", "Sell first"], horizontal=True, key="ps_dir")
+    _c1, _c2 = st.columns(2)
+    _ps_entry = _c1.number_input("Entry price (₹)", min_value=0.0, value=500.0, step=0.05,
+                                 format="%.2f", key="ps_entry")
+    _ps_stop = _c2.number_input("Stop-loss price (₹)", min_value=0.0, value=495.0, step=0.05,
+                                format="%.2f", key="ps_stop")
+    _c3, _c4 = st.columns(2)
+    _ps_risk = _c3.number_input("Max loss on this trade (₹)", min_value=0.0, value=2500.0,
+                                step=100.0, format="%.0f", key="ps_risk")
+    _ps_mult = _c4.number_input("Target = risk ×", min_value=0.5, value=2.0, step=0.5,
+                                format="%.1f", key="ps_mult")
+    _c5, _c6 = st.columns(2)
+    _ps_cap = _c5.number_input("Capital (₹)", min_value=0.0, value=400000.0, step=10000.0,
+                               format="%.0f", key="ps_cap")
+    _ps_chg = _c6.number_input("Charges estimate, round trip (₹)", min_value=0.0, value=300.0,
+                               step=50.0, format="%.0f", key="ps_chg",
+                               help="Check your broker's charge calculator for the real figure.")
+    st.caption("The values above are examples. Replace them with your own trade.")
+
+    _ps = size_position("buy" if _ps_dir == "Buy first" else "sell", _ps_entry, _ps_stop,
+                        _ps_risk, _ps_cap, _ps_mult, _ps_chg)
+    if not _ps.ok:
+        st.warning(_ps.error)
+    else:
+        st.metric("Size", f"{_ps.shares:,} shares",
+                  help=f"Position value ₹{_ps.position_value:,.0f}")
+        st.caption(f"Position value ₹{_ps.position_value:,.0f} · "
+                   f"{'buy' if _ps.direction == 'buy' else 'sell'} at ₹{_ps.entry:,.2f}")
+        _m1, _m2, _m3 = st.columns(3)
+        _m1.metric("Loss if stop hits", f"−₹{_ps.loss_at_stop:,.0f}")
+        _m2.metric("Target price", f"₹{_ps.target:,.2f}")
+        _m3.metric("Profit at target", f"+₹{_ps.gross_profit:,.0f}")
+        _m4, _m5, _m6 = st.columns(3)
+        _m4.metric("Net if win (after charges)", f"₹{_ps.net_profit:,.0f}")
+        _m5.metric("Net if loss (after charges)", f"−₹{_ps.net_loss:,.0f}")
+        _m6.metric("Net reward : risk", f"1 : {_ps.net_reward_to_risk:.2f}")
+        st.caption(f"Risk per share ₹{_ps.risk_per_share:,.2f} · "
+                   f"loss at stop is {_ps.loss_pct_of_capital:.2f}% of capital.")
+        for _note in _ps.notes:
+            st.info(_note)
+
+    with st.expander("Rules for the day"):
+        st.markdown(
+            "- Place the stop-loss order right after you enter.\n"
+            "- One trade a day. After a stop-out, you are done.\n"
+            "- Never move a stop further away or remove it.\n"
+            "- Set a daily loss limit before the open and stop when you hit it.\n"
+            "- Close the trade yourself before your broker's auto square-off time.")
 
 if view == "Intraday":
     st.markdown("### Today's intraday candidates")
