@@ -42,6 +42,7 @@ from stockmerit.intraday.sizing import size_position
 from stockmerit.scoring import backtest as merit_backtest
 from stockmerit.scoring.merit_score import MeritComponents, compute_merit_score
 from stockmerit.radar import scan_master_radar
+from stockmerit.agent import ui as agent_ui
 
 RSI_PERIOD = 14
 FUND_LIMIT = 100
@@ -2557,6 +2558,18 @@ def render_detail(symbol: str):
 @st.dialog("Stock detail", width="small")
 def detail_dialog(symbol: str):
     render_detail(symbol)
+    if st.button("Ask the AI Analyst about this stock", key=f"ask_ai_{symbol}",
+                 use_container_width=True):
+        # hand the symbol to the AI Analyst view; it only runs once that view is unlocked
+        st.session_state["agent_prefill"] = (
+            f"Analyse {symbol} on NSE. Cover the daily technical picture, the setup score, "
+            "the fundamentals you can verify, and whether there is a trade or investment "
+            "case right now. Say NO TRADE if there is none.")
+        st.session_state["_agent_pending_tab"] = "Chat"
+        st.session_state["_pending_view"] = "AI Analyst"
+        if "stock" in st.query_params:
+            del st.query_params["stock"]
+        st.rerun()
     # make the modal draggable (by its top strip) and resizable
     components.html('''
 <script>
@@ -2766,6 +2779,7 @@ live_every = 1
 
 # --- top nav: Screener / Stock OI / News ---
 _view_map = {"screener": "Screener", "intraday": "Intraday", "sizer": "Position Sizer",
+             "ai": "AI Analyst",
              "custom": "Custom Screen",
              "mf": "Mutual Funds", "etf": "ETFs", "sif": "SIF",
              "oi": "Stock OI", "news": "News"}
@@ -2776,7 +2790,7 @@ if "_pending_view" in st.session_state:
     st.session_state["view"] = st.session_state.pop("_pending_view")
 st.session_state.setdefault("view", "Screener")
 st.sidebar.markdown('<div class="nav-h">Sections</div>', unsafe_allow_html=True)
-view = st.sidebar.radio("view", ["Screener", "Master Radar", "Intraday", "Position Sizer",
+view = st.sidebar.radio("view", ["Screener", "Master Radar", "AI Analyst", "Intraday", "Position Sizer",
                                 "Stock OI", "Custom Screen",
                                 "ETFs", "SIF", "Mutual Funds", "News"],
                         label_visibility="collapsed", key="view")
@@ -2817,6 +2831,34 @@ qp_stock = st.query_params.get("stock")
 if qp_stock and _valid_symbol(str(qp_stock)) and st.session_state.get("qp_opened") != qp_stock:
     st.session_state["qp_opened"] = qp_stock
     detail_dialog(str(qp_stock).upper())
+
+def _agent_futures_oi() -> dict:
+    """AI Analyst tool: the same futures OI buildup the Stock OI view shows."""
+    rows, src = get_oi_buildup()
+    return {
+        "rows": [{**r, "signal": oi_signal(r["price_chg"], r.get("oi_chg"))[0]} for r in rows],
+        "source": src,
+        "source_meaning": {"dhan": "price and OI from the Dhan API",
+                           "yf": "price only from a public delayed feed; NO open interest",
+                           "none": "no feed reachable; no data"}.get(src, src),
+        "symbols_covered": OI_SYMBOLS,
+        "fetched_at": dt.datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
+        "note": "Near-month stock futures for a fixed list only. Not an option chain: no "
+                "strikes, PCR, IV or max pain. Never infer OI when source is not 'dhan'.",
+    }
+
+
+_AGENT_OI_TOOL = ({
+    "name": "get_futures_oi_buildup",
+    "description": "Price change and open-interest change for a fixed list of liquid NSE stock "
+                   "futures, with a long/short buildup label. OI is real only when source is "
+                   "'dhan'. This is not an option chain.",
+    "input_schema": {"type": "object", "properties": {}},
+}, _agent_futures_oi)
+
+if view == "AI Analyst":
+    agent_ui.render(_secret, extra_tools=[_AGENT_OI_TOOL], disclaimer=DISCLAIMER)
+    st.stop()
 
 if view == "Master Radar":
     st.markdown("### Master Radar")

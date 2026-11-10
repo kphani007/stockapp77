@@ -1,0 +1,29 @@
+{
+  "_note": "All rates are PERCENT of the stated base. Statutory rates checked against public broker/tax explainers in Nov 2026 (STT on F&O as revised from 1 Apr 2026). Exchange transaction charges differ between sources and change periodically; brokerage and DP charges are broker-specific. VERIFY every value against your broker's contract note before relying on the output.",
+  "last_reviewed": "2026-11-10",
+  "gst_pct": 18.0,
+  "sebi_turnover_pct": 0.0001,
+  "segments": {
+    "delivery": {
+      "stt_buy_pct": 0.1, "stt_sell_pct": 0.1, "stamp_buy_pct": 0.015,
+      "exchange_txn_pct": 0.00297,
+      "brokerage_pct": 0.0, "brokerage_cap_per_order": 0.0, "dp_charge_per_sell": 0.0
+    },
+    "intraday": {
+      "stt_buy_pct": 0.0, "stt_sell_pct": 0.025, "stamp_buy_pct": 0.003,
+      "exchange_txn_pct": 0.00297,
+      "brokerage_pct": 0.03, "brokerage_cap_per_order": 20.0, "dp_charge_per_sell": 0.0
+    },
+    "futures": {
+      "stt_buy_pct": 0.0, "stt_sell_pct": 0.05, "stamp_buy_pct": 0.002,
+      "exchange_txn_pct": 0.00173,
+      "brokerage_pct": 0.03, "brokerage_cap_per_order": 20.0, "dp_charge_per_sell": 0.0
+    },
+    "options": {
+      "_base": "premium turnover",
+      "stt_buy_pct": 0.0, "stt_sell_pct": 0.15, "stamp_buy_pct": 0.003,
+      "exchange_txn_pct": 0.03503,
+      "brokerage_pct": 0.0, "brokerage_flat_per_order": 20.0, "dp_charge_per_sell": 0.0
+    }
+  }
+}
