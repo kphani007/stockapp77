@@ -1,0 +1,4 @@
+{
+  "_note": "Editable watchlist of liquid NSE large caps used by scan_universe. This is NOT an official index constituent list; index membership changes, so maintain it yourself.",
+  "symbols": ["RELIANCE","TCS","HDFCBANK","ICICIBANK","INFY","SBIN","BHARTIARTL","ITC","LT","KOTAKBANK","AXISBANK","HINDUNILVR","BAJFINANCE","MARUTI","SUNPHARMA","TITAN","ASIANPAINT","ULTRACEMCO","NTPC","POWERGRID","M&M","HCLTECH","WIPRO","TECHM","NESTLEIND","ONGC","COALINDIA","TATASTEEL","JSWSTEEL","ADANIPORTS","BAJAJFINSV","DRREDDY","CIPLA","EICHERMOT","HEROMOTOCO","BAJAJ-AUTO","GRASIM","HINDALCO","BPCL","BRITANNIA","APOLLOHOSP","DIVISLAB","TATACONSUM","SBILIFE","HDFCLIFE","TRENT","BEL"]
+}
