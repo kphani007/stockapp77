@@ -288,17 +288,40 @@ def build_candidate(symbol: str, feat: dict, sector: str | None = None,
     }
 
 
-def rank(candidates: list[dict], top_n: int = 5,
-         min_atr_pct: float | None = None) -> dict:
-    """Split a list of ``build_candidate`` records into the top ``top_n`` longs
-    (by bull score) and top ``top_n`` shorts (by bear score).
+# A side's score must reach this to be listed. 50 is neutral, so a stock scoring
+# below it is leaning the other way and is not a candidate for this side at all.
+MIN_SIDE_SCORE = 55.0
 
-    ``min_atr_pct`` optionally drops names too quiet to be worth trading
-    intraday (their ATR% is below the floor)."""
+
+def side_of(candidate: dict) -> str | None:
+    """The one side a stock belongs to: "long" if its bull score beats its bear
+    score, "short" if the reverse, None on an exact tie. The two scores share the
+    same relative-volume term, so this compares the directional evidence only."""
+    if candidate["bull"] > candidate["bear"]:
+        return "long"
+    if candidate["bear"] > candidate["bull"]:
+        return "short"
+    return None
+
+
+def rank(candidates: list[dict], top_n: int = 5,
+         min_atr_pct: float | None = None,
+         min_score: float | None = MIN_SIDE_SCORE) -> dict:
+    """Split ``build_candidate`` records into the top ``top_n`` longs (by bull
+    score) and top ``top_n`` shorts (by bear score).
+
+    Each stock is placed on one side only, the side its scores favour, so the
+    same name can never be both a long and a short candidate. ``min_score``
+    then drops names whose score on their side is too weak to list (pass None
+    to keep every name, e.g. for a preliminary shortlist). ``min_atr_pct``
+    optionally drops names too quiet to be worth trading intraday."""
     pool = candidates
     if min_atr_pct is not None:
         pool = [c for c in pool
                 if (c["feat"].get("atr_pct") or 0) >= min_atr_pct]
-    longs = sorted(pool, key=lambda c: c["bull"], reverse=True)[:top_n]
-    shorts = sorted(pool, key=lambda c: c["bear"], reverse=True)[:top_n]
+    floor = float("-inf") if min_score is None else min_score
+    longs = [c for c in pool if side_of(c) == "long" and c["bull"] >= floor]
+    shorts = [c for c in pool if side_of(c) == "short" and c["bear"] >= floor]
+    longs = sorted(longs, key=lambda c: c["bull"], reverse=True)[:top_n]
+    shorts = sorted(shorts, key=lambda c: c["bear"], reverse=True)[:top_n]
     return {"longs": longs, "shorts": shorts}

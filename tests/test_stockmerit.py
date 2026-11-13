@@ -319,3 +319,30 @@ def test_rank_splits_and_respects_atr_floor():
     # An impossibly high ATR floor drops everything.
     empty = intraday.rank(cands, top_n=5, min_atr_pct=999.0)
     assert empty["longs"] == [] and empty["shorts"] == []
+
+
+def _fake(sym, bull, bear, atr_pct=2.0):
+    return {"symbol": sym, "bull": bull, "bear": bear, "feat": {"atr_pct": atr_pct}}
+
+
+def test_rank_never_lists_a_stock_on_both_sides():
+    # The 13-Nov-2026 NIFTY 50 case: four long-leaning names that also filled
+    # the short table because each side was ranked independently.
+    cands = [_fake("BAJFINANCE", 74, 31), _fake("SUNPHARMA", 70, 32),
+             _fake("SHRIRAMFIN", 64, 40), _fake("HINDALCO", 64, 44)]
+    out = intraday.rank(cands, top_n=4)
+    assert [c["symbol"] for c in out["longs"]] == ["BAJFINANCE", "SUNPHARMA", "SHRIRAMFIN", "HINDALCO"]
+    assert out["shorts"] == []
+    longs = {c["symbol"] for c in out["longs"]}
+    assert not longs & {c["symbol"] for c in out["shorts"]}
+
+
+def test_rank_min_score_and_ties():
+    cands = [_fake("STRONGUP", 70, 35), _fake("WEAKUP", 53, 47),
+             _fake("STRONGDN", 30, 72), _fake("FLAT", 50, 50)]
+    out = intraday.rank(cands, top_n=5)
+    assert [c["symbol"] for c in out["longs"]] == ["STRONGUP"]
+    assert [c["symbol"] for c in out["shorts"]] == ["STRONGDN"]
+    loose = intraday.rank(cands, top_n=5, min_score=None)
+    assert [c["symbol"] for c in loose["longs"]] == ["STRONGUP", "WEAKUP"]
+    assert all(c["symbol"] != "FLAT" for c in loose["longs"] + loose["shorts"])

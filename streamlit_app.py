@@ -1621,7 +1621,9 @@ def intraday_candidates(tickers: tuple[str, ...], top_n: int, min_relvol: float,
 
     priced = len(cands)
     # Preliminary split (no sector yet) to pick a shortlist worth the fund calls.
-    prelim = merit_intraday.rank(cands, top_n=INTRADAY_SHORTLIST, min_atr_pct=min_atr_pct)
+    # No score floor yet: the sector tilt below can still move a score a few points.
+    prelim = merit_intraday.rank(cands, top_n=INTRADAY_SHORTLIST, min_atr_pct=min_atr_pct,
+                                 min_score=None)
     shortlist = {c["symbol"]: c for c in prelim["longs"] + prelim["shorts"]}
 
     # Sector strength across the shortlist, relative to NIFTY's own 3m return.
@@ -3095,7 +3097,9 @@ if view == "Intraday":
         st.info("Pick a stock list and press **Find candidates** to build today's "
                 "long and short shortlist.")
     elif not _ires["longs"] and not _ires["shorts"]:
-        st.warning("No names cleared the relative-volume / ATR filters. Lower the "
+        st.warning("No long or short setups today. Either no names cleared the "
+                   "relative-volume / ATR filters, or none scored "
+                   f"{merit_intraday.MIN_SIDE_SCORE:.0f}+ on its side. Lower the "
                    "minimums or widen the stock list.")
     else:
         _reg_lbl, _reg_score = _ires["regime"]
@@ -3113,13 +3117,21 @@ if view == "Intraday":
         _n_short = len(_ires["shorts"])
         st.markdown(f'<div class="sec-label" style="margin-top:10px;color:#0B7A4B">'
                     f'▲ Top {_n_long} long candidates</div>', unsafe_allow_html=True)
-        st.markdown(_intraday_table(_ires["longs"], "long"), unsafe_allow_html=True)
+        if _ires["longs"]:
+            st.markdown(_intraday_table(_ires["longs"], "long"), unsafe_allow_html=True)
+        else:
+            st.caption(f"No long setups score {merit_intraday.MIN_SIDE_SCORE:.0f} or more today.")
 
         st.markdown(f'<div class="sec-label" style="margin-top:18px;color:#B3261E">'
                     f'▼ Top {_n_short} short candidates</div>', unsafe_allow_html=True)
-        st.markdown(_intraday_table(_ires["shorts"], "short"), unsafe_allow_html=True)
+        if _ires["shorts"]:
+            st.markdown(_intraday_table(_ires["shorts"], "short"), unsafe_allow_html=True)
+        else:
+            st.caption(f"No short setups score {merit_intraday.MIN_SIDE_SCORE:.0f} or more today.")
 
-        st.caption("Score is the 0-100 long (bull) or short (bear) blend. Entry zone, "
+        st.caption("Score is the 0-100 long (bull) or short (bear) blend. Each stock is "
+                   "listed only on the side its scores favour, and only if that score is "
+                   f"{merit_intraday.MIN_SIDE_SCORE:.0f} or more (50 is neutral). Entry zone, "
                    "SL and targets are anchored on ATR and the nearest structural level "
                    "(VWAP, 20 EMA, previous-day high/low); R is entry-to-stop, so 2R / 3R "
                    "are that risk projected in the trade's direction. Sector strength is "
